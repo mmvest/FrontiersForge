@@ -252,7 +252,7 @@ local function Render()
             local entity_map_z = entity.z * world_to_map_texture_scale_factor_z
             local distance = {x = entity_map_x - player_map_texture_x, z = entity_map_z - player_map_texture_z }
             local circle_center = ImVec2.new(mini_map_center.x + distance.x, mini_map_center.y + distance.z)
-            local entity_color = nil
+            local entity_color = state.entity_white_color
             local player_level = Player.GetLevel()
             if      entity.level - 2    >   player_level then entity_color = state.entity_red_color
             elseif  entity.level - 1    >=  player_level then entity_color = state.entity_yellow_color

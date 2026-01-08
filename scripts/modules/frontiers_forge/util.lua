@@ -111,4 +111,15 @@ function Util.IsStartMenuOpen()
     return Util.ReadFromOffset(is_start_menu_open_offset, "uint8_t")
 end
 
+-- Retrieve the player's compass heading in radians
+function Util.GetCompassRadians()
+    local compass_heading_offset = 0x1FB66AC
+    return Util.ReadFromOffset(compass_heading_offset, "float")
+end
+
+-- Convenience wrapper to get compass heading in degrees
+function Util.GetCompassDegrees()
+    return Util.RadiansToDegrees(Util.GetCompassRadians())
+end
+
 return Util
