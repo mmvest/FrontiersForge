@@ -10,6 +10,8 @@ FORGE_SCRIPT_DIR=scripts
 FORGE_MODULES_DIR=modules
 FORGE_RESOURCES_DIR=resources
 
+
+
 # Change this to whichever one you need. Must be one of: d3d11, d3d12, vulkan, opengl
 # I hope to get rid of this option in the future and have the api auto-detected
 GRAPHICS_API=d3d11
@@ -20,5 +22,6 @@ BITS=64
 # Logging -- levels are none = 0, fatal = 1, error = 2, warning = 3, info = 4, debug = 5, verbose = 6
 MAX_LOG_SIZE_BYTES=1000000
 MAX_LOG_FILES=2
+INJECTOR_LOG_FILE_NAME=inject_log.txt
 LOG_FILE_NAME=forge_log.txt
-LOGGING_LEVEL=4
+LOGGING_LEVEL=6
