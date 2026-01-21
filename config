@@ -10,6 +10,11 @@ FORGE_SCRIPT_DIR=scripts
 FORGE_MODULES_DIR=modules
 FORGE_RESOURCES_DIR=resources
 
+# This is relative to the resources directory
+SETTINGS_ICON_FILE=uiforge_icon_gold_small.png
+SETTINGS_ICON_SIZE_X=48
+SETTINGS_ICON_SIZE_Y=48
+
 
 
 # Change this to whichever one you need. Must be one of: d3d11, d3d12, vulkan, opengl
