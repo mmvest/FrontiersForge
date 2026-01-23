@@ -120,5 +120,5 @@ if ImGui.Begin("Bouncing Balls Simulation") then
 
     RenderBalls(window_pos)
 
-    ImGui.End()
 end
+ImGui.End()

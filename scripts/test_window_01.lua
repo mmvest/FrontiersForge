@@ -1,10 +1,11 @@
 local  bit = require("bit")
 
 state = state or {
-    window_open         = true,
     button_clicked      = false,
     checkbox_checked    = false,
     radio_buttons       = 0,
+    input_demo_text     = "Type here...",
+    input_demo_label    = "Label will update on Enter",
     slider_float        = 0.5,
     slider_int          = 5,
     combo_items         = {"Item 01", "Item 02", "Item 03"},
@@ -27,9 +28,7 @@ state = state or {
 }
 
 -- Make a window
-
-if ImGui.Begin("Hello, UiForge!", state.window_open, ImGuiWindowFlags.MenuBar) then
-    
+if ImGui.Begin("Hello, UiForge!", true, ImGuiWindowFlags.MenuBar) then
     -- Menu Bars
     if ImGui.BeginMenuBar() then
         if ImGui.BeginMenu("Menu 01") then
@@ -87,6 +86,18 @@ if ImGui.Begin("Hello, UiForge!", state.window_open, ImGuiWindowFlags.MenuBar) t
 
         -- Combo Box
         state.combo_index = ImGui.Combo("Combo Box", state.combo_index, state.combo_items, #state.combo_items)
+
+        -- Input Text (press Enter to "submit")
+        ImGui.Separator()
+        ImGui.Text("Input box demo")
+        ImGui.TextDisabled("Hit Enter to change label")
+        local enter_returns_true_flag = (ImGuiInputTextFlags and ImGuiInputTextFlags.EnterReturnsTrue) or 0
+        local new_text, enter_pressed = ImGui.InputText("Input Box", state.input_demo_text, enter_returns_true_flag)
+        state.input_demo_text = new_text
+        if enter_pressed then
+            state.input_demo_label = (state.input_demo_text ~= "" and state.input_demo_text) or "(empty)"
+        end
+        ImGui.Text("Label: " .. state.input_demo_label)
         ImGui.TreePop()
     end
 
@@ -184,7 +195,7 @@ if ImGui.Begin("Hello, UiForge!", state.window_open, ImGuiWindowFlags.MenuBar) t
     -- Window Flags
 
     if ImGui.TreeNode("Window Flags") then
-
+        
         local flags = {
             { name = "No Title Bar",                flag = ImGuiWindowFlags.NoTitleBar },
             { name = "No Resize",                   flag = ImGuiWindowFlags.NoResize },
@@ -216,21 +227,22 @@ if ImGui.Begin("Hello, UiForge!", state.window_open, ImGuiWindowFlags.MenuBar) t
             end
         end
 
-        ImGui.Begin("Demo Window" , true, state.demo_window_flags)
-            ImGui.PushStyleColor(ImGuiCol.PlotHistogram, 0, .33, 0, 1)
-            ImGui.ProgressBar(state.demo_cur_health / state.demo_max_health, state.demo_max_health, 30, state.demo_cur_health .. "/" .. state.demo_max_health)
-            ImGui.PopStyleColor()
-            ImGui.SameLine()
-            if ImGui.Button("Hit", 30, 30) then
-                if state.demo_cur_health <= 0 then
-                    state.demo_cur_health = state.demo_max_health
-                else
-                    state.demo_cur_health = state.demo_cur_health - state.demo_damage
-                end
+        ImGui.Begin("Demo Window", true, state.demo_window_flags)
+
+        ImGui.PushStyleColor(ImGuiCol.PlotHistogram, 0, .33, 0, 1)
+        ImGui.ProgressBar(state.demo_cur_health / state.demo_max_health, state.demo_max_health, 30, state.demo_cur_health .. "/" .. state.demo_max_health)
+        ImGui.PopStyleColor()
+        ImGui.SameLine()
+        if ImGui.Button("Hit", 30, 30) then
+            if state.demo_cur_health <= 0 then
+                state.demo_cur_health = state.demo_max_health
+            else
+                state.demo_cur_health = state.demo_cur_health - state.demo_damage
             end
+        end
 
         ImGui.End()
-        
+    
         ImGui.TreePop()
     end
 
@@ -273,6 +285,8 @@ if ImGui.Begin("Hello, UiForge!", state.window_open, ImGuiWindowFlags.MenuBar) t
         end
         ImGui.TreePop()
     end
+
 end
--- End the window (MUST BE CALLED REGARDLESS OF THE RESULT OF BEGIN)
+
+--end the window
 ImGui.End()
