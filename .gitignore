@@ -5,6 +5,7 @@
 *.pdb
 *.ilk
 *.idb
+releases/
 
 # Visual Studio Code settings
 .vscode/
@@ -12,3 +13,4 @@
 # Logs
 forge_log*
 inject_log*
+

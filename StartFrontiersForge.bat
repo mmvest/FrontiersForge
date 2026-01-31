@@ -1,3 +1,3 @@
 @echo off
 
-.\bin\UiForge.exe -n pcsx2-qt.exe
+.\UiForge\UiForge.exe -n pcsx2-qt.exe
