@@ -1,0 +1,3 @@
+[submodule "UiForge"]
+	path = UiForge
+	url = https://github.com/mmvest/User-Interface-Forge.git

@@ -1,6 +1,6 @@
 <h1 align="center">FrontiersForge</h1>
 <p align="center">
-  <a href="https://github.com/mmvest/FrontiersForge/blob/main/LICENSE">
+  <a href="https://github.com/mmvest/FrontiersForge/blob/main/LICENSE.txt">
     <img src="https://img.shields.io/github/license/mmvest/FrontiersForge.svg?style=flat-square"/>
   </a>
   <br>
@@ -27,21 +27,45 @@ Use this code at your own risk. UiForge injects code into the PCSX2 emulator and
 
 1. Clone the repository:
     ```bash
-    git clone https://github.com/mmvest/FrontiersForge.git
+    git clone --recurse-submodules https://github.com/mmvest/FrontiersForge.git
     cd FrontiersForge
     ```
 
-1. Make sure you have **PCSX2 v2.0.2** or **v2.2.0** and **EQOA: Frontiers (US Version) ISO**.
+   If you already cloned without submodules, run:
+   ```bash
+   git submodule update --init --recursive
+   ```
+
+   Note: UiForge is included as a git submodule and built binaries (like `uiforge_core.dll`) are no longer distributed directly with the repo. Use the release zip files or build locally.
+
+1. Make sure you have **PCSX2 v2.0.0** or greater and **EQOA: Frontiers (US Version) ISO**.
 1. Place your UI Lua scripts (dubbed ForgeScripts by the UiForge Project) in the `scripts` directory.
 1. Run `pcsx2-qt.exe`, start EQOA, and then execute `StartFrontiersForge.bat`.
 
 Once started, the UiForge settings icon should appear in the top-left corner. Click on it to see the UiForge menu. Click the settings icon again to close the UiForge menu.
 
-To detach UiForge from the process and clean it up, press the "END" key.
+To detach UiForge from the process and clean it up, press `Ctrl+Shift+Alt+End` (PCSX2 must be the focused window for the eject hotkey to work).
 
 To enable a script, click the checkbox next to it. Scripts that create Lua Errors are disabled automatically.
 
 To see script settings or debug stats, click on the script name. If it has any settings, the settings will appear in the settings tab. Debug stats can be viewed by clicking the debug tab.
+
+## Building (from source)
+
+`BuildFrontiersForge.bat` builds the UiForge submodule and then updates this repo’s `scripts/` by copying the latest scripts from `UiForge/scripts` into `scripts/` (overwriting old versions).
+
+1. Ensure you can build UiForge (see the UiForge repo for the requirements).
+1. Run:
+   ```bat
+   BuildFrontiersForge.bat
+   ```
+
+To create a release zip:
+```bat
+BuildFrontiersForge.bat -zip -version 1.2.3
+```
+
+This writes `releases/FrontiersForge-v1.2.3.zip`.
 
 ## Roadmap
 
@@ -83,7 +107,7 @@ This is just a "meta" file to help enable intellisense and static analysis funct
 
 ## License
 
-This project is licensed under the MIT License. See the [LICENSE](LICENSE) file for more details.
+This project is licensed under the MIT License. See the [LICENSE.txt](LICENSE.txt) file for more details.
 
 ## Contributing
 
