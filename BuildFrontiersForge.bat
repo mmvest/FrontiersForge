@@ -152,6 +152,7 @@ if not "%ERRORLEVEL%"=="0" (
 )
 
 echo Created: %ZIP_PATH%
+if exist "%RELEASES_DIR%\_staging\" rmdir /S /Q "%RELEASES_DIR%\_staging"
 exit /b 0
 
 :usage
