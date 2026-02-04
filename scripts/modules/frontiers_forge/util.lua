@@ -14,9 +14,44 @@ ffi.cdef[[
         int* lpUsedDefaultChar
     );
 
+    int MultiByteToWideChar(
+        unsigned int CodePage,
+        unsigned long dwFlags,
+        const char* lpMultiByteStr,
+        int cbMultiByte,
+        wchar_t* lpWideCharStr,
+        int cchWideChar
+    );
+
     enum {
         CP_UTF8 = 65001
     };
+
+    typedef void* HANDLE;
+    typedef unsigned long DWORD;
+    typedef int BOOL;
+
+    typedef struct _FILETIME {
+        DWORD dwLowDateTime;
+        DWORD dwHighDateTime;
+    } FILETIME;
+
+    typedef struct _WIN32_FIND_DATAW {
+        DWORD dwFileAttributes;
+        FILETIME ftCreationTime;
+        FILETIME ftLastAccessTime;
+        FILETIME ftLastWriteTime;
+        DWORD nFileSizeHigh;
+        DWORD nFileSizeLow;
+        DWORD dwReserved0;
+        DWORD dwReserved1;
+        wchar_t cFileName[260];
+        wchar_t cAlternateFileName[14];
+    } WIN32_FIND_DATAW;
+
+    HANDLE FindFirstFileW(const wchar_t* lpFileName, WIN32_FIND_DATAW* lpFindFileData);
+    BOOL FindNextFileW(HANDLE hFindFile, WIN32_FIND_DATAW* lpFindFileData);
+    BOOL FindClose(HANDLE hFindFile);
 ]]
 
 
@@ -88,6 +123,33 @@ function Util.utf16_to_utf8(utf16_ptr)
     return ffi.string(utf8_str)
 end
 
+function Util.utf8_to_utf16(utf8_str)
+    utf8_str = tostring(utf8_str or "")
+
+    local wide_len = ffi.C.MultiByteToWideChar(
+        ffi.C.CP_UTF8, 0,
+        utf8_str, -1,
+        nil, 0
+    )
+
+    if wide_len == 0 then
+        error("Failed to calculate UTF-16 length")
+    end
+
+    local wide_buf = ffi.new("wchar_t[?]", wide_len)
+    local written = ffi.C.MultiByteToWideChar(
+        ffi.C.CP_UTF8, 0,
+        utf8_str, -1,
+        wide_buf, wide_len
+    )
+
+    if written == 0 then
+        error("Failed to convert UTF-8 to UTF-16")
+    end
+
+    return wide_buf
+end
+
 function Util.GetExpRequiredForLevel(level)
     return exp_for_levels[level]
 end
@@ -120,6 +182,60 @@ end
 -- Convenience wrapper to get compass heading in degrees
 function Util.GetCompassDegrees()
     return Util.RadiansToDegrees(Util.GetCompassRadians())
+end
+
+function Util.ListFiles(pattern, options)
+    options = options or {}
+
+    local FILE_ATTRIBUTE_DIRECTORY = 0x10
+    local INVALID_HANDLE_VALUE = ffi.cast("HANDLE", -1)
+    local base_dir = tostring(options.base_dir or "")
+    if base_dir ~= "" and not base_dir:match("[\\\\/]$") then
+        base_dir = base_dir .. "\\"
+    end
+
+    local wide_pattern = Util.utf8_to_utf16(pattern)
+    local find_data = ffi.new("WIN32_FIND_DATAW[1]")
+    local h = ffi.C.FindFirstFileW(wide_pattern, find_data)
+
+    if h == INVALID_HANDLE_VALUE then
+        return {}
+    end
+
+    local results = {}
+    while true do
+        local data = find_data[0]
+
+        if bit.band(tonumber(data.dwFileAttributes), FILE_ATTRIBUTE_DIRECTORY) == 0 then
+            local name = Util.utf16_to_utf8(data.cFileName)
+            if name ~= "" and name ~= "." and name ~= ".." then
+                if options.full_path == true then
+                    results[#results + 1] = base_dir .. name
+                else
+                    results[#results + 1] = name
+                end
+            end
+        end
+
+        if ffi.C.FindNextFileW(h, find_data) == 0 then
+            break
+        end
+    end
+
+    ffi.C.FindClose(h)
+    return results
+end
+
+function Util.ListFilesInDir(dir, glob, options)
+    dir = tostring(dir or "")
+    glob = tostring(glob or "*")
+    options = options or {}
+
+    if options.full_path == true and options.base_dir == nil then
+        options.base_dir = dir
+    end
+
+    return Util.ListFiles(dir .. "\\" .. glob, options)
 end
 
 return Util

@@ -61,11 +61,405 @@ mini_map_state = mini_map_state or {
     entity_light_blue_color     = 0xFFFF8080,
     entity_green_color          = 0xFF00FF00,
     entity_gray_color           = 0xFF808080,
+
+    -- Entity Tracking
+    entity_tracking_enabled     = false,
+    ping_tracked_entities       = false,
+    line_to_tracked_entities    = false,
+    tracked_entity_input        = "",
+    tracked_entities            = {},
+    tracked_entities_by_key     = {},
+    tracked_entities_index_dirty= true,
+    tracked_entities_loaded     = false,
+    tracked_entities_status     = "",
+    tracked_entities_file_name  = "minimap_tracked_entities.entl",
+    tracked_entities_file_name_buffer = "minimap_tracked_entities.entl",
+    tracked_entities_available_lists = {},
+    tracked_entities_lists_status = "",
+    _tracked_entities_combo_was_open = false,
     
 }
 
+--[[
+Entity tracking system
+
+The mini-map always renders "all nearby entities" from the game. Entity tracking is an *optional* layer on top that
+lets you highlight a small, user-managed list of entity names (e.g., "Grass Snake", "Hatchling", "Lionwere").
+
+- `tracked_entities` is the saved list (array) of entries the user is tracking. Each entry stores its display `name`,
+a normalized `key` (lowercased name + trimmed), an `enabled` flag, and optional per-entity colors.
+
+- `tracked_entities_by_key` is a fast lookup table: normalized name -> index in `tracked_entities`. This avoids scanning
+  the list every frame and prevents duplicates.
+
+- When tracking is enabled, each rendered entity name is normalized and looked up in `tracked_entities_by_key` to decide
+  whether it should be highlighted / pinged / have a line drawn to it.
+]]
+mini_map_state.entity_tracking_enabled  = mini_map_state.entity_tracking_enabled or false
+mini_map_state.ping_tracked_entities    = mini_map_state.ping_tracked_entities or false
+mini_map_state.line_to_tracked_entities = mini_map_state.line_to_tracked_entities or false
+mini_map_state.tracked_entity_input     = mini_map_state.tracked_entity_input or ""
+mini_map_state.tracked_entities         = mini_map_state.tracked_entities or {}
+mini_map_state.tracked_entities_by_key  = mini_map_state.tracked_entities_by_key or {}
+mini_map_state.tracked_entities_index_dirty = (mini_map_state.tracked_entities_index_dirty ~= false)
+mini_map_state.tracked_entities_loaded  = mini_map_state.tracked_entities_loaded or false
+mini_map_state.tracked_entities_status  = mini_map_state.tracked_entities_status or ""
+mini_map_state.tracked_entities_file_name = mini_map_state.tracked_entities_file_name or "minimap_tracked_entities.entl"
+mini_map_state.tracked_entities_file_name_buffer = mini_map_state.tracked_entities_file_name_buffer or mini_map_state.tracked_entities_file_name
+mini_map_state.tracked_entities_available_lists = mini_map_state.tracked_entities_available_lists or {}
+mini_map_state.tracked_entities_lists_status = mini_map_state.tracked_entities_lists_status or ""
+mini_map_state._tracked_entities_combo_was_open = mini_map_state._tracked_entities_combo_was_open or false
+
 local function ScaleVec2(width, height, scale)
     return width * scale, height * scale
+end
+
+local function Trim(str)
+    if str == nil then return "" end
+
+    -- Convert to string, then strip leading (^%s+) and trailing (%s+$) whitespace via gsub.
+    return (tostring(str):gsub("^%s+", ""):gsub("%s+$", ""))
+end
+
+local function NormalizeEntityName(name)
+    return Trim(name):lower()
+end
+
+local function RebuildTrackedEntitiesIndex()
+    mini_map_state.tracked_entities_by_key = {}
+    
+    -- We want O(1) lookups from entity name to tracked entry while rendering (so we don't scan the list every frame).
+    -- We also normalize names (trim/lowercase) so " Goblin " and "goblin" point to the same tracked entry.
+    for tracked_list_index, entry in ipairs(mini_map_state.tracked_entities) do
+        entry.name = Trim(entry.name)
+        entry.key = NormalizeEntityName(entry.name)
+        mini_map_state.tracked_entities_by_key[entry.key] = tracked_list_index
+
+        if entry.enabled == nil then entry.enabled = true end
+        if entry.fill_color == nil then entry.fill_color = {1, 1, 0, 1} end
+        if entry.border_color == nil then entry.border_color = {1, 1, 1, 1} end
+    end
+
+    mini_map_state.tracked_entities_index_dirty = false
+end
+
+-- We want to avoid rebuilding the tracked entities list every frame, so we check if
+-- the tracked entities index is dirty. If it is, then we rebuild the index.
+local function EnsureTrackedEntitiesIndex()
+    if mini_map_state.tracked_entities_index_dirty == true then
+        RebuildTrackedEntitiesIndex()
+    end
+end
+
+local function SanitizeFileName(file_name)
+    file_name = Trim(file_name)
+    if file_name == "" then
+        file_name = "minimap_tracked_entities.entl"
+    end
+
+    -- Avoid invalid Windows filename characters. This isn't a comprehensive solution...
+    -- just don't be dumb with file names
+    file_name = file_name:gsub("[\\\\/:%*%?\"<>|]", "_")
+
+    local lower = file_name:lower()
+    if lower:match("%.entl$") then
+        return file_name
+    end
+
+    -- If the user types ".txt" out of habit, normalize it.
+    if lower:match("%.txt$") then
+        return file_name:sub(1, #file_name - 4) .. ".entl"
+    end
+
+    return file_name .. ".entl"
+end
+
+local function GetTrackedEntitiesFilePath()
+    local file_name = SanitizeFileName(mini_map_state.tracked_entities_file_name)
+    return UiForge.resources_path .. "\\mini_map\\" .. file_name
+end
+
+local function Clamp01(value)
+    value = tonumber(value)
+    if value == nil then return nil end
+    if value < 0 then return 0 end
+    if value > 1 then return 1 end
+    return value
+end
+
+local function ParseBool(value)
+    value = Trim(value):lower()
+    return (value == "true" or value == "1" or value == "yes" or value == "on")
+end
+
+local function CsvEscapeField(value)
+    value = tostring(value or "")
+
+    -- When saving to CSV we must quote fields that could break parsing:
+    -- - commas/newlines (they would look like separators/extra rows)
+    -- - quotes (they must be escaped as doubled quotes per CSV rules)
+    -- - leading/trailing spaces
+    if value:find("[\",\n\r]") or value:find("^%s") or value:find("%s$") then
+        value = value:gsub("\"", "\"\"")
+        return "\"" .. value .. "\""
+    end
+    return value
+end
+
+local function CsvParseLine(line)
+    -- Minimal CSV parser that:
+    -- - splits on commas, except when inside quotes
+    -- - supports escaped quotes ("") inside quoted fields
+    local parsed_fields = {}
+    local current_field = ""
+    local is_in_quotes = false
+    local position = 1
+    local line_length = #line
+
+    while position <= line_length do
+        local char = line:sub(position, position)
+        if is_in_quotes then
+            if char == "\"" then
+                -- If we see a doubled quote ("") while in quotes, that represents a literal quote character.
+                if position < line_length and line:sub(position + 1, position + 1) == "\"" then
+                    current_field = current_field .. "\""
+                    position = position + 1
+                else
+                    is_in_quotes = false
+                end
+            else
+                current_field = current_field .. char
+            end
+        else
+            if char == "," then
+                parsed_fields[#parsed_fields + 1] = current_field
+                current_field = ""
+            elseif char == "\"" then
+                is_in_quotes = true
+            else
+                current_field = current_field .. char
+            end
+        end
+        position = position + 1
+    end
+
+    parsed_fields[#parsed_fields + 1] = current_field
+    return parsed_fields
+end
+
+local function AddTrackedEntity(name)
+    EnsureTrackedEntitiesIndex()
+
+    name = Trim(name)
+    if name == "" then return end
+
+    local key = NormalizeEntityName(name)
+    if mini_map_state.tracked_entities_by_key[key] ~= nil then
+        mini_map_state.tracked_entities_status = "Already tracking: " .. name
+        return
+    end
+
+    mini_map_state.tracked_entities[#mini_map_state.tracked_entities + 1] = {
+        name = name,
+        key = key,
+        enabled = true,
+        fill_color = {1, 1, 0, 1},
+        border_color = {1, 1, 1, 1},
+    }
+
+    mini_map_state.tracked_entities_index_dirty = true
+    RebuildTrackedEntitiesIndex()
+    mini_map_state.tracked_entities_status = "Added: " .. name
+end
+
+local function RemoveTrackedEntityAtIndex(index)
+    table.remove(mini_map_state.tracked_entities, index)
+    mini_map_state.tracked_entities_index_dirty = true
+    RebuildTrackedEntitiesIndex()
+end
+
+local function ClearTrackedEntities()
+    mini_map_state.tracked_entities = {}
+    mini_map_state.tracked_entities_index_dirty = true
+    RebuildTrackedEntitiesIndex()
+    mini_map_state.tracked_entities_status = "Cleared all tracked entities"
+end
+
+-- Saves the current tracked entity list to an `.entl` file under `resources\\mini_map`.
+local function SaveTrackedEntitiesToFile()
+    EnsureTrackedEntitiesIndex()
+
+    local path = GetTrackedEntitiesFilePath()
+    local file = io.open(path, "w")
+    if file == nil then
+        mini_map_state.tracked_entities_status = "Failed to write: " .. path
+        return false
+    end
+
+    file:write("# minimap_tracked_entities.entl\n")
+    file:write("# One entity per line (CSV): name,enabled,fillR,fillG,fillB,fillA,borderR,borderG,borderB,borderA\n")
+
+    for _, entry in ipairs(mini_map_state.tracked_entities) do
+        local parts = {
+            CsvEscapeField(entry.name),
+            (entry.enabled and "true" or "false"),
+            tostring(entry.fill_color[1]), tostring(entry.fill_color[2]), tostring(entry.fill_color[3]), tostring(entry.fill_color[4]),
+            tostring(entry.border_color[1]), tostring(entry.border_color[2]), tostring(entry.border_color[3]), tostring(entry.border_color[4]),
+        }
+        file:write(table.concat(parts, ","), "\n")
+    end
+
+    file:close()
+    mini_map_state.tracked_entities_status = "Saved: " .. path
+    return true
+end
+
+-- Loads a tracked entity list from an `.entl` file under `resources\\mini_map`.
+local function LoadTrackedEntitiesFromFile()
+    local path = GetTrackedEntitiesFilePath()
+    local file = io.open(path, "r")
+    if file == nil then
+        mini_map_state.tracked_entities_status = "No tracked entities file found"
+        return false
+    end
+
+    local loaded = {}
+
+    for line in file:lines() do
+        local trimmed = Trim(line)
+        if trimmed ~= "" and not trimmed:match("^#") then
+            local fields = CsvParseLine(trimmed)
+            if #fields >= 2 then
+                local name = Trim(fields[1])
+                if name ~= "" then
+                    local enabled = ParseBool(fields[2])
+                    local fill = {1, 1, 0, 1}
+                    local border = {1, 1, 1, 1}
+
+                    if #fields >= 10 then
+                        local fr = Clamp01(fields[3]); local fg = Clamp01(fields[4]); local fb = Clamp01(fields[5]); local fa = Clamp01(fields[6])
+                        local br = Clamp01(fields[7]); local bg = Clamp01(fields[8]); local bb = Clamp01(fields[9]); local ba = Clamp01(fields[10])
+
+                        if fr and fg and fb and fa then fill = {fr, fg, fb, fa} end
+                        if br and bg and bb and ba then border = {br, bg, bb, ba} end
+                    end
+
+                    loaded[#loaded + 1] = {
+                        name = name,
+                        enabled = enabled,
+                        fill_color = fill,
+                        border_color = border,
+                    }
+                end
+            end
+        end
+    end
+
+    file:close()
+
+    mini_map_state.tracked_entities = loaded
+    mini_map_state.tracked_entities_index_dirty = true
+    RebuildTrackedEntitiesIndex()
+    mini_map_state.tracked_entities_status = "Loaded: " .. path
+    return true
+end
+
+local function TryLoadTrackedEntitiesOnce()
+    EnsureTrackedEntitiesIndex()
+    if mini_map_state.tracked_entities_loaded == true then return end
+
+    LoadTrackedEntitiesFromFile()
+    mini_map_state.tracked_entities_loaded = true
+end
+
+local function RefreshTrackedEntitiesAvailableLists()
+    local dir = tostring(UiForge.resources_path) .. "\\mini_map"
+
+    local ok, lines_or_err = pcall(Util.ListFilesInDir, dir, "*.entl")
+    if not ok then
+        mini_map_state.tracked_entities_lists_status = tostring(lines_or_err or "Unable to list .entl files")
+        mini_map_state.tracked_entities_available_lists = { SanitizeFileName(mini_map_state.tracked_entities_file_name) }
+        return
+    end
+
+    local lines = lines_or_err or {}
+
+    local results = {}
+    local seen = {}
+
+    for _, line in ipairs(lines) do
+        local name = Trim(line)
+        if name ~= "" then
+            local sanitized = SanitizeFileName(name)
+            if not seen[sanitized] then
+                seen[sanitized] = true
+                results[#results + 1] = sanitized
+            end
+        end
+    end
+
+    local active = SanitizeFileName(mini_map_state.tracked_entities_file_name)
+    if not seen[active] then
+        results[#results + 1] = active
+    end
+
+    table.sort(results)
+    mini_map_state.tracked_entities_available_lists = results
+    mini_map_state.tracked_entities_lists_status = ""
+end
+
+local function OpenSaveTrackedEntitiesAsPopup()
+    mini_map_state.tracked_entities_file_name_buffer = mini_map_state.tracked_entities_file_name
+    ImGui.OpenPopup("Save Tracked Entities As")
+end
+
+local function RenderSaveTrackedEntitiesAsPopup()
+    local always_auto_resize = (ImGuiWindowFlags and ImGuiWindowFlags.AlwaysAutoResize) or 0
+    if not ImGui.BeginPopupModal("Save Tracked Entities As", true, always_auto_resize) then
+        return
+    end
+
+    ImGui.Text("Save tracked entities list")
+    ImGui.Separator()
+
+    ImGui.TextDisabled("Folder:")
+    ImGui.SameLine()
+    ImGui.TextUnformatted(tostring(UiForge.resources_path) .. "\\mini_map\\")
+
+    local hint = "e.g. bosses.entl"
+    local enter_returns_true_flag = (ImGuiInputTextFlags and ImGuiInputTextFlags.EnterReturnsTrue) or 0
+    local new_text, enter_pressed = ImGui.InputTextWithHint("File name", hint, mini_map_state.tracked_entities_file_name_buffer, enter_returns_true_flag)
+    if new_text ~= nil then
+        mini_map_state.tracked_entities_file_name_buffer = new_text
+    end
+
+    local sanitized = SanitizeFileName(mini_map_state.tracked_entities_file_name_buffer)
+    ImGui.TextDisabled("Will use:")
+    ImGui.SameLine()
+    ImGui.TextUnformatted(sanitized)
+
+    if ImGui.Button("Save") or enter_pressed then
+        mini_map_state.tracked_entities_file_name = sanitized
+        SaveTrackedEntitiesToFile()
+
+        ImGui.CloseCurrentPopup()
+        ImGui.EndPopup()
+        return
+    end
+
+    ImGui.SameLine()
+    if ImGui.Button("Use Default") then
+        mini_map_state.tracked_entities_file_name_buffer = "minimap_tracked_entities.entl"
+    end
+
+    ImGui.SameLine()
+    if ImGui.Button("Cancel") then
+        ImGui.CloseCurrentPopup()
+        ImGui.EndPopup()
+        return
+    end
+
+    ImGui.EndPopup()
 end
 
 local function ToggleCompass()
@@ -132,10 +526,14 @@ local function Initialize()
     if mini_map_state.player_indicator_fill_texture == nil then mini_map_state.player_indicator_fill_texture = UiForge.IGraphicsApi.CreateTextureFromFile(UiForge.resources_path .. "\\mini_map\\player_indicator_fill.png") end
     ToggleCompass()
 
+    -- If we have a saved tracked entity file, try to load it
+    TryLoadTrackedEntitiesOnce()
+
     mini_map_state.initialized = true
 end
 
 local function Settings()
+    TryLoadTrackedEntitiesOnce()
 
     mini_map_state.map_scale    = ImGui.SliderFloat("Map Scale", mini_map_state.map_scale, 0.1, 5.0, tostring(mini_map_state.map_scale))
     mini_map_state.map_zoom     = ImGui.SliderInt("Map Zoom", mini_map_state.map_zoom, 1, 5, tostring(mini_map_state.map_zoom))
@@ -159,6 +557,105 @@ local function Settings()
     mini_map_state.show_entity_border       = ImGui.Checkbox("Show Entity Border", mini_map_state.show_entity_border)
     mini_map_state.entity_border_thickness  = ImGui.SliderFloat("Entity Border Thickness", mini_map_state.entity_border_thickness, 0, mini_map_state.entity_radius - 1, tostring(mini_map_state.entity_border_thickness))
     mini_map_state.entity_border_color      = ImGui.ColorEdit4("Entity Border Color", mini_map_state.entity_border_color)
+
+    ImGui.Separator()
+    ImGui.Text("Entity Tracking")
+    mini_map_state.entity_tracking_enabled  = ImGui.Checkbox("Enable Entity Tracking", mini_map_state.entity_tracking_enabled)
+    mini_map_state.ping_tracked_entities    = ImGui.Checkbox("Ping Tracked Entities", mini_map_state.ping_tracked_entities)
+    mini_map_state.line_to_tracked_entities = ImGui.Checkbox("Line to Tracked Entities", mini_map_state.line_to_tracked_entities)
+
+    ImGui.TextDisabled("Type a name and press Enter to track")
+    local enter_returns_true_flag = (ImGuiInputTextFlags and ImGuiInputTextFlags.EnterReturnsTrue) or 0
+    local new_text, enter_pressed = ImGui.InputText("Track Entity", mini_map_state.tracked_entity_input, enter_returns_true_flag)
+    mini_map_state.tracked_entity_input = new_text
+    if enter_pressed then
+        AddTrackedEntity(mini_map_state.tracked_entity_input)
+        mini_map_state.tracked_entity_input = ""
+    end
+
+    if mini_map_state.tracked_entities_status ~= "" then
+        ImGui.TextDisabled(mini_map_state.tracked_entities_status)
+    end
+
+    if ImGui.CollapsingHeader("Tracked Entities") then
+        local active_file = SanitizeFileName(mini_map_state.tracked_entities_file_name)
+
+        ImGui.Text("Active List:")
+        ImGui.SameLine()
+        local combo_open = ImGui.BeginCombo("##trackedEntitiesList", active_file)
+        if combo_open then
+            if mini_map_state._tracked_entities_combo_was_open ~= true then
+                RefreshTrackedEntitiesAvailableLists()
+            end
+            mini_map_state._tracked_entities_combo_was_open = true
+
+            local lists = mini_map_state.tracked_entities_available_lists or {}
+            local active_key = active_file:lower()
+            if #lists == 0 then
+                ImGui.TextDisabled("(no .entl files found)")
+            else
+                for _, file_name in ipairs(lists) do
+                    local is_selected = (file_name:lower() == active_key)
+                    if ImGui.Selectable(file_name, is_selected) then
+                        local selected_file = SanitizeFileName(file_name)
+                        mini_map_state.tracked_entities_file_name = selected_file
+                        LoadTrackedEntitiesFromFile()
+                        mini_map_state.tracked_entities_loaded = true
+                        active_key = selected_file:lower()
+                    end
+                    if is_selected then
+                        ImGui.SetItemDefaultFocus()
+                    end
+                end
+            end
+
+            if mini_map_state.tracked_entities_lists_status ~= "" then
+                ImGui.Separator()
+                ImGui.TextDisabled(mini_map_state.tracked_entities_lists_status)
+            end
+
+            ImGui.EndCombo()
+        else
+            mini_map_state._tracked_entities_combo_was_open = false
+        end
+
+        if ImGui.Button("Clear All Tracked") then
+            ClearTrackedEntities()
+        end
+        ImGui.SameLine()
+        if ImGui.Button("Save") then
+            SaveTrackedEntitiesToFile()
+        end
+        ImGui.SameLine()
+        if ImGui.Button("Save As...") then
+            OpenSaveTrackedEntitiesAsPopup()
+        end
+
+        RenderSaveTrackedEntitiesAsPopup()
+
+        for i = 1, #mini_map_state.tracked_entities do
+            local entry = mini_map_state.tracked_entities[i]
+            ImGui.PushID(entry.key or i)
+
+            entry.enabled = ImGui.Checkbox("##enabled", entry.enabled)
+            ImGui.SameLine()
+            ImGui.TextUnformatted(entry.name)
+            ImGui.SameLine()
+            if ImGui.Button("X##remove") then
+                ImGui.PopID()
+                RemoveTrackedEntityAtIndex(i)
+                break
+            end
+
+            ImGui.SameLine()
+            entry.fill_color = ImGui.ColorEdit4("Fill Color", entry.fill_color, ImGuiColorEditFlags.NoInputs)
+            ImGui.SameLine()
+            entry.border_color = ImGui.ColorEdit4("Border Color", entry.border_color, ImGuiColorEditFlags.NoInputs)
+
+            ImGui.Separator()
+            ImGui.PopID()
+        end
+    end
     -- ImGui.Text("If the mini-map seems a a little bit off,\nuse these sliders to adjust your position on the map.")
     -- mini_map_state.map_texture_offset_x    = ImGui.SliderInt("X offset", mini_map_state.map_texture_offset_x, 0, 300, tostring(mini_map_state.map_texture_offset_x))
     -- mini_map_state.map_texture_offset_y    = ImGui.SliderInt("Y offset", mini_map_state.map_texture_offset_y, 0, 300, tostring(mini_map_state.map_texture_offset_y))
@@ -179,6 +676,7 @@ local function Render()
     if Util.IsInGame() == 0 or Util.IsStartMenuOpen() == 1 then return end
 
     local state = mini_map_state -- Shortcut for readability
+    TryLoadTrackedEntitiesOnce()
 
     if ImGui.Begin("mini map window", true, state.window_flags) then
         local cursor_x, cursor_y = ImGui.GetCursorPos()
@@ -243,47 +741,112 @@ local function Render()
 
         local mini_map_center = ImVec2.new(window_pos.x + half_mini_map_width, window_pos.y + half_mini_map_height)
         local entity_list = EntityList.GetAllEntities()
-        table.remove(entity_list, 1) -- The first entity is the player -- toss it
 
-        ImGui.PushClipRect(window_pos.x, window_pos.y, window_pos.x + scaled_mini_map_width, window_pos.y + scaled_mini_map_height, true)
-        for _, entity in pairs(entity_list) do
-            -- Calculate the entity's position on the mini-map
-            local entity_map_x = entity.x * world_to_map_texture_scale_factor_x
-            local entity_map_z = entity.z * world_to_map_texture_scale_factor_z
-            local distance = {x = entity_map_x - player_map_texture_x, z = entity_map_z - player_map_texture_z }
-            local circle_center = ImVec2.new(mini_map_center.x + distance.x, mini_map_center.y + distance.z)
-            local entity_color = state.entity_white_color
-            local player_level = Player.GetLevel()
-            if      entity.level - 2    >   player_level then entity_color = state.entity_red_color
-            elseif  entity.level - 1    >=  player_level then entity_color = state.entity_yellow_color
-            elseif  entity.level        ==  player_level then entity_color = state.entity_white_color
-            elseif  entity.level + 1    ==  player_level then entity_color = state.entity_dark_blue_color
-            elseif  entity.level + 2    ==  player_level then entity_color = state.entity_light_blue_color
-            elseif  entity.level + 5    <=  player_level then entity_color = state.entity_gray_color
-            elseif  entity.level + 3    <=  player_level then entity_color = state.entity_green_color
+        if state.show_entities == true then
+            local default_border_color = ImGui.GetColorU32(
+                state.entity_border_color[1],
+                state.entity_border_color[2],
+                state.entity_border_color[3],
+                state.entity_border_color[4]
+            )
+
+            local tracking_enabled = (state.entity_tracking_enabled == true and state.tracked_entities_by_key ~= nil)
+            local line_color = ImGui.GetColorU32(1, 1, 1, 0.75)
+
+            local ping_phase = nil
+            if tracking_enabled and state.ping_tracked_entities == true then
+                local ping_period = 1.5
+                local ping_duration = 0.35
+                local ping_t = ImGui.GetTime() % ping_period
+                if ping_t <= ping_duration then
+                    ping_phase = ping_t / ping_duration
+                end
             end
 
-            draw_list:AddCircleFilled(circle_center, state.entity_radius, entity_color)
-            if state.show_entity_border == true then 
-                local border_color = ImGui.GetColorU32( state.entity_border_color[1],
-                                                        state.entity_border_color[2],
-                                                        state.entity_border_color[3],
-                                                        state.entity_border_color[4])
-                draw_list:AddCircle(circle_center, state.entity_radius, border_color, 0, state.entity_border_thickness)
+            local ping_color = nil
+            if ping_phase ~= nil then
+                ping_color = ImGui.GetColorU32(1, 1, 1, 1.0 - ping_phase)
             end
-            
-            -- Render a tooltip when mousing over an entity
-            local mouse_x, mouse_y = ImGui.GetMousePos()
-            local distance_squared = (mouse_x - circle_center.x)^2 + (mouse_y - circle_center.y)^2
-            if distance_squared <= state.entity_radius^2 then
-                ImGui.BeginTooltip()
-                ImGui.Text(entity.name .. "(" .. entity.level .. ")\n" ..
-                        "ID: " .. entity.id .. "\n" ..
-                        string.format("Coordinates: %.2f, %.2f, %.2f", entity.x, entity.y, entity.z))
-                ImGui.EndTooltip()
+
+            ImGui.PushClipRect(window_pos.x, window_pos.y, window_pos.x + scaled_mini_map_width, window_pos.y + scaled_mini_map_height, true)
+            -- EntityList.GetAllEntities() always includes the player in slot 1.
+            for entity_index = 2, #entity_list do
+                local entity = entity_list[entity_index]
+
+                -- When entities despawn, memory can transiently contain "empty slot" data.
+                -- Skip obviously-invalid entries to avoid rendering artifacts and tooltip issues.
+                if entity ~= nil and entity.id ~= 0 and entity.name ~= "" then
+                    -- Calculate the entity's position on the mini-map
+                    local entity_map_x = entity.x * world_to_map_texture_scale_factor_x
+                    local entity_map_z = entity.z * world_to_map_texture_scale_factor_z
+                    local distance = {x = entity_map_x - player_map_texture_x, z = entity_map_z - player_map_texture_z }
+                    local circle_center = ImVec2.new(mini_map_center.x + distance.x, mini_map_center.y + distance.z)
+
+                local player_level = Player.GetLevel()
+                local fill_color_u32 = state.entity_white_color
+                if      entity.level - 2    >   player_level then fill_color_u32 = state.entity_red_color
+                elseif  entity.level - 1    >=  player_level then fill_color_u32 = state.entity_yellow_color
+                elseif  entity.level        ==  player_level then fill_color_u32 = state.entity_white_color
+                elseif  entity.level + 1    ==  player_level then fill_color_u32 = state.entity_dark_blue_color
+                elseif  entity.level + 2    ==  player_level then fill_color_u32 = state.entity_light_blue_color
+                elseif  entity.level + 5    <=  player_level then fill_color_u32 = state.entity_gray_color
+                elseif  entity.level + 3    <=  player_level then fill_color_u32 = state.entity_green_color
+                end
+
+                local is_tracked = false
+                local tracked_border_color = default_border_color
+                if tracking_enabled then
+                    local tracked_index = state.tracked_entities_by_key[NormalizeEntityName(entity.name)]
+                    if tracked_index ~= nil then
+                        local tracked_entry = state.tracked_entities[tracked_index]
+                        if tracked_entry ~= nil and tracked_entry.enabled ~= false then
+                            is_tracked = true
+                            fill_color_u32 = ImGui.GetColorU32(
+                                tracked_entry.fill_color[1],
+                                tracked_entry.fill_color[2],
+                                tracked_entry.fill_color[3],
+                                tracked_entry.fill_color[4]
+                            )
+                            tracked_border_color = ImGui.GetColorU32(
+                                tracked_entry.border_color[1],
+                                tracked_entry.border_color[2],
+                                tracked_entry.border_color[3],
+                                tracked_entry.border_color[4]
+                            )
+                        end
+                    end
+                end
+
+                if is_tracked and state.line_to_tracked_entities == true then
+                    draw_list:AddLine(mini_map_center, circle_center, line_color, 1.0)
+                end
+
+                draw_list:AddCircleFilled(circle_center, state.entity_radius, fill_color_u32)
+
+                if state.show_entity_border == true or is_tracked then
+                    draw_list:AddCircle(circle_center, state.entity_radius, (is_tracked and tracked_border_color or default_border_color), 0, state.entity_border_thickness)
+                end
+
+                if is_tracked and ping_color ~= nil then
+                    local ping_radius = state.entity_radius + 4 + (ping_phase * 18)
+                    draw_list:AddCircle(circle_center, ping_radius, ping_color, 0, 2.0)
+                end
+
+                -- Render a tooltip when mousing over an entity
+                local mouse_x, mouse_y = ImGui.GetMousePos()
+                    local distance_squared = (mouse_x - circle_center.x)^2 + (mouse_y - circle_center.y)^2
+                    if distance_squared <= state.entity_radius^2 then
+                        ImGui.BeginTooltip()
+                        -- ImGui.Text() is printf-style: treat entity names as untrusted and render unformatted.
+                        ImGui.TextUnformatted(entity.name .. "(" .. entity.level .. ")\n" ..
+                                "ID: " .. entity.id .. "\n" ..
+                                string.format("Coordinates: %.2f, %.2f, %.2f", entity.x, entity.y, entity.z))
+                        ImGui.EndTooltip()
+                    end
+                end
             end
+            ImGui.PopClipRect()
         end
-        ImGui.PopClipRect()
 
         -- Render player
         ImGui.SetCursorPos(cursor_x, cursor_y)
