@@ -23,22 +23,16 @@ typedef struct
 
 local Chat = {}
 
-local chat_log_offset       = 0x26CDC8
-local chat_log_size         = 32        -- 32 messages in chatlog circular buffer
-local message_size_bytes    = 160       -- bytes
-local max_message_chars     = 64        -- 64 wchar_t characters in a message max
+local chat_log_offset       = 0xA7AF28
+local chat_log_size         = 32
 local chat_log = ffi.cast("chat_log*", Util.EEmem() + chat_log_offset)
 
-local function GetTailIndex()
-    return chat_log.tail_index;
-end
-
 local function GetHeadIndex()
-    return chat_log.head_index;
+    return chat_log.head_index
 end
 
 local function GetMessageID(index)
-    return chat_log.messages[index].id;
+    return chat_log.messages[index].id
 end
 
 local function GetMessageDataAsString(index)
@@ -49,8 +43,6 @@ local function GetMessageType(index)
     return chat_log.messages[index].type
 end
 
--- Make sure we can increment or decrement an index
--- while handling the wrapping nature of a circular buffer
 local function AdjustIndex(index, offset)
     local new_index = (index + offset) % chat_log_size
     if new_index < 0 then new_index = new_index + chat_log_size end
@@ -60,11 +52,13 @@ end
 Chat.MsgType = {
     Say = 0x3F800000,
     Shout = 0x3E7CFCFD,
-    -- Haven't gotten these ones yet
     Party = nil,
-    Tell = nil, 
+    Tell = nil,
     Guild = nil,
 }
+
+-- NEW: track last-returned message id so GetNextMessage() is non-blocking
+local last_returned_id = 0
 
 function Chat.GetNextMessage()
     -- Get the current head index.
@@ -77,33 +71,46 @@ function Chat.GetNextMessage()
     -- Grab the message ID
     local last_msg_id = GetMessageID(last_msg_index)
 
-    local temp_msg_index = last_msg_index
-    local temp_msg_id = last_msg_id
-
+    -- If nothing has changed, return empty string (non-blocking)
+    if last_msg_id == 0 or last_msg_id == last_returned_id then
+        return "", 0
+    end
 
     -- While the messages contain the same ID, keep going backward
     -- This is so we can find the start of the full message
-    while last_msg_id == temp_msg_id do
+    -- Find start of message by walking backwards WHILE IDs match,
+    -- but NEVER loop forever: hard cap at chat_log_size steps.
+    local temp_msg_index = last_msg_index
+    local temp_msg_id = last_msg_id
+
+    local steps = 0
+    while last_msg_id == temp_msg_id and steps < chat_log_size do
         temp_msg_index = AdjustIndex(temp_msg_index, -1)
         temp_msg_id = GetMessageID(temp_msg_index)
+        steps = steps + 1
     end
-    
-    -- Temp message index contains the index of the first message struct
-    -- that is not part of the current message, so add 1 to account for
-    -- this so we are on the starting message struct of the current message.
+
+    -- If we never found a differing id (buffer full of same id), just treat
+    -- last_msg_index as the start to avoid freezing.
+    if steps >= chat_log_size then
+        temp_msg_index = AdjustIndex(last_msg_index, -1)
+    end
+
+    -- Move to the first struct of the current message
     last_msg_index = AdjustIndex(temp_msg_index, 1)
     local msg_type = GetMessageType(last_msg_index)
 
-    -- Concatenate all content
+    -- Concatenate message chunks up to head_index, but cap again for safety
     local msg_contents = ""
-    while last_msg_index ~= head_index do
+    steps = 0
+    while last_msg_index ~= head_index and steps < chat_log_size do
         msg_contents = msg_contents .. GetMessageDataAsString(last_msg_index)
         last_msg_index = AdjustIndex(last_msg_index, 1)
+        steps = steps + 1
     end
-    
-    -- return string and type
-    return msg_contents, msg_type
 
+    last_returned_id = last_msg_id
+    return msg_contents, msg_type
 end
 
 function Chat.GetMessageTypeString(msg_type)
