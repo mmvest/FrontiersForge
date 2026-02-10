@@ -1,31 +1,41 @@
 local Util = require("frontiers_forge.util")
 
-local offsets = {
-    health_bar          = 0x01E13DDC,
-    power_bar           = 0x01E13E60,
-    main_exp_bar        = 0x01E14044,
-    secondary_exp_bar   = 0x01E14018,
-    compass_face        = 0x01E13D20,
-    compass_back        = 0x01E13D5C,
-    target_nameplate    = 0x01E1416C,
-    active_effects      = 0x0026904C,
-    ability_bar         = 0x0027315C,
-    chat_window         = 0x01DF5B5C
+-- This offset is the base of the UI rendering code-block for the 9VIWndGame window.
+-- This window handles compass, health, power, experience, and target nameplate.
+-- Since the code is an overlay, it can be written anywhere in memory.
+-- Due to this, we have to use a pointer chain to get the location.
+local wnd_game_offset = Util.GetOffsetFromPointerChain(0x14E200, {0x190 , 0x53C, 0x20, 0x1C})
+
+-- This offset is the base of the UI Rendering code-block for 9VIWndChat window.
+-- This window handles the chat pop-up for typing, the players active effects (buffs),
+-- the ability bar, and the chat window in the bottom right.
+local wnd_chat_offset = Util.GetOffsetFromPointerChain(0x4E37F4, {0x14, 0x688, 0x20, 0x1C})
+
+local NOP = 0x00000000
+
+-- These element offsets are offsets away from base_offset
+local ui_elements = {
+    -- element_name     = {opcode_offset, original_opcode}
+    compass_back        = { type = "opcode", base_offset = wnd_game_offset, steps = {0x00C8}, opcode = NOP},
+    compass_face        = { type = "opcode", base_offset = wnd_game_offset, steps = {0x0104}, opcode = NOP},
+    health_bar          = { type = "opcode", base_offset = wnd_game_offset, steps = {0x0184}, opcode = NOP},
+    power_bar           = { type = "opcode", base_offset = wnd_game_offset, steps = {0x0208}, opcode = NOP},
+    secondary_exp_bar   = { type = "opcode", base_offset = wnd_game_offset, steps = {0x03C0}, opcode = NOP},
+    main_exp_bar        = { type = "opcode", base_offset = wnd_game_offset, steps = {0x03EC}, opcode = NOP},
+    target_nameplate    = { type = "opcode", base_offset = wnd_game_offset, steps = {0x0514}, opcode = NOP},
+    chat_window         = { type = "opcode", base_offset = wnd_chat_offset, steps = {0xE8}, opcode = NOP},
+    active_effects      = { type = "flag", base_offset = 0x4E37F4, steps = {0x14, 0x74C}},
+    ability_bar         = { type = "flag", base_offset = 0x4E37F4, steps = {0x1C}}
 }
 
 local UI = {}
 
-local eqoa_mips_opcodes = eqoa_mips_opcodes or {NOP = 0x00000000}
-
 local function NopInstruction(offset)
-    local original_opcode = Util.ReadFromOffset(offset, "uint32_t")
-    eqoa_mips_opcodes[offset] = original_opcode
-
-    Util.WriteToOffset(offset, "uint32_t", eqoa_mips_opcodes.NOP)
+    Util.WriteToOffset(offset, "uint32_t", NOP)
 end
 
-local function RestoreInstruction(offset)
-    Util.WriteToOffset(offset, "uint32_t", eqoa_mips_opcodes[offset])
+local function RestoreInstruction(offset, opcode)
+    Util.WriteToOffset(offset, "uint32_t", opcode)
 end
 
 local function DisableFlag(offset)
@@ -36,16 +46,38 @@ local function EnableFlag(offset)
     Util.WriteToOffset(offset, "uint8_t", 1)
 end
 
+local function DisableUIElement(ui_element)
+    local offset = Util.GetOffsetFromPointerChain(ui_element.base_offset, ui_element.steps)
+    if(ui_element.type == "opcode") then
+        local curr_opcode = Util.ReadFromOffset(offset, "uint32_t")
+        if(curr_opcode ~= NOP) then
+            ui_element.opcode = curr_opcode
+        end
+        NopInstruction(offset)
+    elseif(ui_element.type == "flag") then
+        DisableFlag(offset)
+    end
+end
+
+local function EnableUIElement(ui_element)
+    local offset = Util.GetOffsetFromPointerChain(ui_element.base_offset, ui_element.steps)
+    if(ui_element.type == "opcode" and ui_element.opcode ~= NOP) then
+        RestoreInstruction(offset, ui_element.opcode)
+    elseif(ui_element.type == "flag") then
+        EnableFlag(offset)
+    end
+end
+
 -- ╔═══════════════════════════════════════════════════════════════════════════╗
 -- ║                                Health Bar                                 ║
 -- ╚═══════════════════════════════════════════════════════════════════════════╝
 
 function UI.DisableHealthBar()
-    NopInstruction(offsets.health_bar)
+    DisableUIElement(ui_elements.health_bar)
 end
 
 function UI.EnableHealthBar()
-    RestoreInstruction(offsets.health_bar)
+    EnableUIElement(ui_elements.health_bar)
 end
 
 -- ╔═══════════════════════════════════════════════════════════════════════════╗
@@ -53,11 +85,11 @@ end
 -- ╚═══════════════════════════════════════════════════════════════════════════╝
 
 function UI.DisablePowerBar()
-    NopInstruction(offsets.power_bar)
+    DisableUIElement(ui_elements.power_bar)
 end
 
 function UI.EnablePowerBar()
-    RestoreInstruction(offsets.power_bar)
+    EnableUIElement(ui_elements.power_bar)
 end
 
 -- ╔═══════════════════════════════════════════════════════════════════════════╗
@@ -65,19 +97,19 @@ end
 -- ╚═══════════════════════════════════════════════════════════════════════════╝
 
 function UI.DisableMainExpBar()
-    NopInstruction(offsets.main_exp_bar)
+    DisableUIElement(ui_elements.main_exp_bar)
 end
 
 function UI.EnableMainExpBar()
-    RestoreInstruction(offsets.main_exp_bar)
+    EnableUIElement(ui_elements.main_exp_bar)
 end
 
 function UI.DisableSecondaryExpBar()
-    NopInstruction(offsets.secondary_exp_bar)
+    DisableUIElement(ui_elements.secondary_exp_bar)
 end
 
 function UI.EnableSecondaryExpBar()
-    RestoreInstruction(offsets.secondary_exp_bar)
+    EnableUIElement(ui_elements.secondary_exp_bar)
 end
 
 function UI.DisableExperienceBars()
@@ -94,24 +126,24 @@ end
 -- ║                                 Compass                                   ║
 -- ╚═══════════════════════════════════════════════════════════════════════════╝
 function UI.DisableCompass()
-    NopInstruction(offsets.compass_face)
-    NopInstruction(offsets.compass_back)
+    DisableUIElement(ui_elements.compass_face)
+    DisableUIElement(ui_elements.compass_back)
 end
 
 function UI.EnableCompass()
-    RestoreInstruction(offsets.compass_face)
-    RestoreInstruction(offsets.compass_back)
+    EnableUIElement(ui_elements.compass_face)
+    EnableUIElement(ui_elements.compass_back)
 end
 
 -- ╔═══════════════════════════════════════════════════════════════════════════╗
 -- ║                             Target Nameplate                              ║
 -- ╚═══════════════════════════════════════════════════════════════════════════╝
 function UI.DisableTargetNameplate()
-    NopInstruction(offsets.target_nameplate)
+    DisableUIElement(ui_elements.target_nameplate)
 end
 
 function UI.EnableTargetNameplate()
-    RestoreInstruction(offsets.target_nameplate)
+    EnableUIElement(ui_elements.target_nameplate)
 end
 
 -- ╔═══════════════════════════════════════════════════════════════════════════╗
@@ -119,11 +151,11 @@ end
 -- ╚═══════════════════════════════════════════════════════════════════════════╝
 
 function UI.DisableActiveEffectsDisplay()
-    DisableFlag(offsets.active_effects)
+    DisableUIElement(ui_elements.active_effects)
 end
 
 function UI.EnableActiveEffectsDisplay()
-    EnableFlag(offsets.active_effects)
+    EnableUIElement(ui_elements.active_effects)
 end
 
 -- ╔═══════════════════════════════════════════════════════════════════════════╗
@@ -131,11 +163,11 @@ end
 -- ╚═══════════════════════════════════════════════════════════════════════════╝
 
 function UI.DisableAbilityBar()
-    DisableFlag(offsets.ability_bar)
+    DisableUIElement(ui_elements.ability_bar)
 end
 
 function UI.EnableAbilityBar()
-    EnableFlag(offsets.ability_bar)
+    EnableUIElement(ui_elements.ability_bar)
 end
 
 -- ╔═══════════════════════════════════════════════════════════════════════════╗
@@ -143,11 +175,11 @@ end
 -- ╚═══════════════════════════════════════════════════════════════════════════╝
 
 function UI.DisableChatWindow()
-    NopInstruction(offsets.chat_window)
+    DisableUIElement(ui_elements.chat_window)
 end
 
 function UI.EnableChatWindow()
-    RestoreInstruction(offsets.chat_window)
+    EnableUIElement(ui_elements.chat_window)
 end
 
 function UI.DisableUI()

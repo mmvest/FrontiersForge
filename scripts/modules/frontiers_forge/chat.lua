@@ -23,7 +23,7 @@ typedef struct
 
 local Chat = {}
 
-local chat_log_offset       = 0xA7AF28
+local chat_log_offset       = Util.GetOffsetFromPointerChain(0x14E200, {0x178, 0x654, 0x688, 0x1A8})
 local chat_log_size         = 32
 local chat_log = ffi.cast("chat_log*", Util.EEmem() + chat_log_offset)
 
@@ -52,12 +52,12 @@ end
 Chat.MsgType = {
     Say = 0x3F800000,
     Shout = 0x3E7CFCFD,
-    Party = nil,
-    Tell = nil,
-    Guild = nil,
+    Party = 0x3F000000,
+    Tell = 0x3F008081,
+    Guild = 0x3E800000,
 }
 
--- NEW: track last-returned message id so GetNextMessage() is non-blocking
+-- track last-returned message id so GetNextMessage() is non-blocking
 local last_returned_id = 0
 
 function Chat.GetNextMessage()
