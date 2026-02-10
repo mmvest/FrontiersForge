@@ -93,6 +93,33 @@ function Util.WriteToOffset(offset, ctype, value)
     ptr[0] = value
 end
 
+-- This function traverses through a pointer chain and returns the final offset.
+-- It works by taking a base_offset, reading the value at that offset, then using
+-- each step value to move to the next address in the chain. It is a bit confusing,
+-- but hopefully the following example helps.
+-- Example chain: 4FA500 -> 25C -> 684 -> 1F8 -> target offset
+--   Read 4FA500         -> 01FF6860
+--   01FF6860 + 25C      = 01FF6ABC
+--   Read 01FF6ABC       -> 00268970
+--   00268970 + 684      = 00268FF4
+--   Read 00268FF4       -> 0026CC40
+--   0026CC40 + 1F8      = 0026CE38
+--   0026CE38 is the target offset
+--   We return 0026CE38
+-- base_offset in this case is 0x4FA500
+-- steps is { 0x25C, 0x684, 0x1F8 }
+--- @param base_offset integer Base offset from EEMem to start traversal from.
+--- @param steps integer[] Ordered pointer-chain step values to add between reads.
+--- @return integer target_offset Final resolved offset after all chain steps.
+function Util.GetOffsetFromPointerChain(base_offset, steps)
+    local target_offset = base_offset
+    for idx, step in ipairs(steps) do
+        target_offset = Util.ReadFromOffset(target_offset, "uint32_t") + step
+    end
+
+    return target_offset
+end
+
 -- UTF-16 to UTF-8 conversion using WideCharToMultiByte
 -- Assumes null-terminated string
 function Util.utf16_to_utf8(utf16_ptr)
