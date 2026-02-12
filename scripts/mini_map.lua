@@ -27,7 +27,7 @@ mini_map_state = mini_map_state or {
     default_texture_border_color    = ImVec4.new(0,0,0,0),
 
     -- General Settings
-    disable_compass             = true,
+    disable_compass             = false,
 
     -- Map Settings
     map_scale                   = 1,
