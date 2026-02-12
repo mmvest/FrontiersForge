@@ -28,6 +28,7 @@ mini_map_state = mini_map_state or {
 
     -- General Settings
     disable_compass             = false,
+    disable_in_start_menu       = false,
 
     -- Map Settings
     map_scale                   = 1,
@@ -534,6 +535,15 @@ end
 
 local function Settings()
     TryLoadTrackedEntitiesOnce()
+    
+    local is_compass_disabled, compass_check_pressed = ImGui.Checkbox("Disable Compass", mini_map_state.disable_compass)
+    -- We perform this check here so we do not write NOP to the compass code every single frame.
+    if compass_check_pressed then
+        mini_map_state.disable_compass = is_compass_disabled
+        ToggleCompass()
+    end
+
+    -- mini_map_state.disable_in_start_menu = ImGui.CheckBox("Hide When Start Menu is Open", mini_map_state.disable_in_start_menu)
 
     mini_map_state.map_scale    = ImGui.SliderFloat("Map Scale", mini_map_state.map_scale, 0.1, 5.0, tostring(mini_map_state.map_scale))
     mini_map_state.map_zoom     = ImGui.SliderInt("Map Zoom", mini_map_state.map_zoom, 1, 5, tostring(mini_map_state.map_zoom))
@@ -659,11 +669,6 @@ local function Settings()
     -- ImGui.Text("If the mini-map seems a a little bit off,\nuse these sliders to adjust your position on the map.")
     -- mini_map_state.map_texture_offset_x    = ImGui.SliderInt("X offset", mini_map_state.map_texture_offset_x, 0, 300, tostring(mini_map_state.map_texture_offset_x))
     -- mini_map_state.map_texture_offset_y    = ImGui.SliderInt("Y offset", mini_map_state.map_texture_offset_y, 0, 300, tostring(mini_map_state.map_texture_offset_y))
-    local new_val, pressed = ImGui.Checkbox("Disable Compass", mini_map_state.disable_compass)
-    if pressed then
-        mini_map_state.disable_compass = new_val
-        ToggleCompass()
-    end
 end
 
 local function RegisterSettings()
@@ -672,10 +677,12 @@ local function RegisterSettings()
 end
 
 local function Render()
-    -- If we are not in game or if the start menu is open, don't display minimap
-    if Util.IsInGame() == 0 or Util.IsStartMenuOpen() == 1 then return end
 
     local state = mini_map_state -- Shortcut for readability
+
+    -- If we are not in game or if the start menu is open, don't display minimap
+    if Util.IsInGame() == 0 or (state.disable_in_start_menu and Util.IsStartMenuOpen() == 1) then return end
+
     TryLoadTrackedEntitiesOnce()
 
     if ImGui.Begin("mini map window", true, state.window_flags) then
