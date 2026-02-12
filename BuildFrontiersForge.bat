@@ -86,18 +86,17 @@ if "%SKIP_BUILD%"=="1" (
 ) else (
   set "UIFORGE_BUILD_SCRIPT="
   if exist "%UIFORGE_DIR%\build_uiforge.bat" set "UIFORGE_BUILD_SCRIPT=build_uiforge.bat"
-  if exist "%UIFORGE_DIR%\builduiforge.bat" set "UIFORGE_BUILD_SCRIPT=builduiforge.bat"
-  if exist "%UIFORGE_DIR%\BuildUiForge.bat" set "UIFORGE_BUILD_SCRIPT=BuildUiForge.bat"
 
-  if "%UIFORGE_BUILD_SCRIPT%"=="" (
+  rem NOTE: This block runs under parentheses; use delayed expansion for vars set inside.
+  if "!UIFORGE_BUILD_SCRIPT!"=="" (
     echo ERROR: Could not find UiForge build script in "%UIFORGE_DIR%"
     exit /b 1
   )
 
   echo.
-  echo === Building UiForge: %UIFORGE_BUILD_SCRIPT% ===
+  echo === Building UiForge: !UIFORGE_BUILD_SCRIPT! ===
   pushd "%UIFORGE_DIR%" >nul
-  call "%UIFORGE_BUILD_SCRIPT%"
+  call "!UIFORGE_BUILD_SCRIPT!"
   set "BUILD_RC=!ERRORLEVEL!"
   popd >nul
   if not "!BUILD_RC!"=="0" (

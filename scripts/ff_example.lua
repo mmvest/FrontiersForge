@@ -242,13 +242,28 @@ local function DisplayCameraFunctions()
     end
 end
 
+demo_chat_state = demo_chat_state or {
+    last_contents = nil,
+    last_type = nil
+}
+
 local function DisplayChatFunctions()
     if ImGui.CollapsingHeader("Chat Functions") then
-        -- TODO: Malfunctioning -- fix these
         local msg_contents, msg_type = Chat.GetNextMessage()
-        ImGui.Text("Message Contents: " .. msg_contents)
-        ImGui.Text("Message Size (Characters): " .. #msg_contents)
-        ImGui.Text("Message Type: " .. Chat.GetMessageTypeString(msg_type))
+        if msg_contents ~= "" then
+            demo_chat_state.last_contents = msg_contents
+            demo_chat_state.last_type = msg_type
+        end
+
+        if demo_chat_state.last_contents == nil or demo_chat_state.last_contents == "" then
+            ImGui.TextUnformatted("(no messages)")
+        else
+            ImGui.PushTextWrapPos(0.0)
+            ImGui.Text("GetNextMessage.msg_contents: " .. demo_chat_state.last_contents)
+            ImGui.PopTextWrapPos()
+            ImGui.Text("GetNextMessage.msg_type: " .. demo_chat_state.last_type)
+            ImGui.Text("GetMessageTypeString: " .. Chat.GetMessageTypeString(demo_chat_state.last_type))
+        end
     end
 end
 
@@ -273,6 +288,7 @@ end
 local function DisplayToolbeltFunctions()
 end
 
+-- TODO: BROKEN
 local function DisplayAbilityBarFunctions()
     if ImGui.CollapsingHeader("AbilityBar Functions") then
         for bar_index = 0, 1 do
