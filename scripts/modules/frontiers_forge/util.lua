@@ -196,7 +196,7 @@ function Util.IsInGame()
 end
 
 function Util.IsStartMenuOpen()
-    local is_start_menu_open_offset = 0x26CC44
+    local is_start_menu_open_offset = Util.GetOffsetFromPointerChain(0x14E200, {0x15C, 0x53C, 0x8, 0x88, 0x24})
     return Util.ReadFromOffset(is_start_menu_open_offset, "uint8_t")
 end
 
