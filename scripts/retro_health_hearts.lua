@@ -6,7 +6,7 @@ local Util = require("frontiers_forge.util")            -- Access Utility functi
 retro_health_hearts_state = retro_health_hearts_state or {
     window_flags                = ImGuiWindowFlags.AlwaysAutoResize + ImGuiWindowFlags.NoBackground + ImGuiWindowFlags.NoTitleBar,
     initialized                 = false,
-    settings_registered         = false,
+    callbacks_registered         = false,
 
     -- textures
     heart_accent_texture        = nil,
@@ -89,9 +89,14 @@ local function Settings()
     end
 end
 
-local function RegisterSettings()
-    UiForge.RegisterScriptSettings(Settings)
-    retro_health_hearts_state.settings_registered = true
+local function OnDisable()
+    UI.EnableHealthBar()
+end
+
+local function RegisterCallbacks()
+    UiForge.RegisterCallback(UiForge.CallbackType.Settings, Settings)
+    UiForge.RegisterCallback(UiForge.CallbackType.DisableScript, OnDisable)
+    retro_health_hearts_state.callbacks_registered = true
 end
 
 local function Render()
@@ -169,6 +174,6 @@ local state = retro_health_hearts_state
 
 if state.initialized == false then Initialize() end
 
-if state.settings_registered == false then RegisterSettings() end
+if state.callbacks_registered == false then RegisterCallbacks() end
 
 if state.initialized then Render() end

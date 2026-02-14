@@ -10,12 +10,16 @@ FORGE_SCRIPT_DIR=scripts
 FORGE_MODULES_DIR=modules
 FORGE_RESOURCES_DIR=resources
 
+# For script hot-reloading; when enabled, scripts are automatically reloaded when their file changes
+# Set this to 1 to enable, or 0 to disable.
+RELOAD_ON_SAVE=0
+# How often (in ms) to check script file timestamps when reload-on-save is enabled
+RELOAD_ON_SAVE_POLL_MS=2500
+
 # This is relative to the resources directory
 SETTINGS_ICON_FILE=uiforge_icon_gold_small.png
 SETTINGS_ICON_SIZE_X=48
 SETTINGS_ICON_SIZE_Y=48
-
-
 
 # Change this to whichever one you need. Must be one of: d3d11, d3d12, vulkan, opengl
 # I hope to get rid of this option in the future and have the api auto-detected

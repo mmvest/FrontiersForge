@@ -672,7 +672,7 @@ local function Settings()
 end
 
 local function RegisterSettings()
-    UiForge.RegisterScriptSettings(Settings)
+    UiForge.RegisterCallback(UiForge.CallbackType.Settings, Settings)
     mini_map_state.settings_registered = true
 end
 

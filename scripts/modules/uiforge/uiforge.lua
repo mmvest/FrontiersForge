@@ -7,6 +7,11 @@ UiForge.scripts_path    = ""    -- Contains the path to the `scripts` directory
 UiForge.modules_path    = ""    -- Contains the path to the `modules` directory
 UiForge.resources_path  = ""    -- Contains the path to the `resources` directory
 
+UiForge.CallbackType = {
+    Settings = 0,
+    DisableScript = 1,
+}
+
 UiForge.IGraphicsApi = {}
 
 --- Create a texture compatible with ImGui.Image
@@ -16,10 +21,10 @@ function UiForge.IGraphicsApi.CreateTextureFromFile(path_to_image)
     return nil
 end
 
---- Register a settings callback function that is used to display script settings
---- in the UiForge control panel (settings menu)
---- @param callback function The callback function to execute to display the settings in the control panel.
-function UiForge.RegisterScriptSettings(callback)
+--- Register a script callback (settings, disable, etc) for the currently running script.
+--- @param callback_type integer One of `UiForge.CallbackType`.
+--- @param callback function The callback function to register.
+function UiForge.RegisterCallback(callback_type, callback)
 end
 
 return UiForge

@@ -90,7 +90,7 @@ local function Settings()
 end
 
 if test_02_state.settings_registered == false then
-    UiForge.RegisterScriptSettings(Settings)
+    UiForge.RegisterCallback(UiForge.CallbackType.Settings, Settings)
     test_02_state.settings_registered = true
 end
 
