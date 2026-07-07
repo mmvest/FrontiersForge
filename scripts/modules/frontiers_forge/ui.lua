@@ -4,6 +4,11 @@ local Util = require("frontiers_forge.util")
 -- This window handles compass, health, power, experience, and target nameplate.
 -- Since the code is an overlay, it can be written anywhere in memory.
 -- Due to this, we have to use a pointer chain to get the location.
+--
+-- For future reference, all seven element offsets we nop that are based in this window
+-- are plain draw calls that sit strictly between this function's VIWindow_BeginDraw (+0x5C)
+-- and VIWindow_EndDraw (+0x57C), so NOP'ing them individually is safe as the draw-context
+-- save/restore stays balanced and no state leaks into other UI.
 local wnd_game_offset = Util.GetOffsetFromPointerChain(0x14E200, {0x190 , 0x53C, 0x20, 0x1C})
 
 -- This offset is the base of the UI Rendering code-block for 9VIWndChat window.
@@ -12,6 +17,23 @@ local wnd_game_offset = Util.GetOffsetFromPointerChain(0x14E200, {0x190 , 0x53C,
 local wnd_chat_offset = Util.GetOffsetFromPointerChain(0x4E37F4, {0x14, 0x688, 0x20, 0x1C})
 
 local NOP = 0x00000000
+
+-- The chat window can't be disabled by NOP'ing its draw instruction like the other elements.
+-- At chat_offset+0xE8 the game calls VIWindow_BeginDraw, which saves the global scratchpad
+-- matrices and installs the chat window's own 2D overlay transform. The matching VIWindow_EndDraw
+-- at +0x470 restores them.
+--
+-- Instead we replace the BeginDraw call with a PC-relative branch straight to the function's
+-- epilogue at +0x4E4, skipping BeginDraw, every chat draw call, AND EndDraw together. Scratchpad
+-- state is left completely untouched, so nothing leaks and other UI windows are unaffected.
+--
+-- This fixes a bug caused by NOP'ing the original instruction where the disabled chat box would
+-- render under whatever transform is currently live. For example, when the player presses R1 to
+-- select a target, the chat box appears next to the target indicator and rotates around the target.
+--
+-- Opcode: beq zero, zero, +0x3FC  ->  0x100000FE
+--   offset = (0x4E4 - 0xE8 - 4) / 4 = 0xFE.
+local CHAT_WINDOW_DISABLE_BRANCH = 0x100000FE
 
 -- These element offsets are offsets away from base_offset
 local ui_elements = {
@@ -23,18 +45,14 @@ local ui_elements = {
     secondary_exp_bar   = { type = "opcode", base_offset = wnd_game_offset, steps = {0x03C0}, opcode = NOP},
     main_exp_bar        = { type = "opcode", base_offset = wnd_game_offset, steps = {0x03EC}, opcode = NOP},
     target_nameplate    = { type = "opcode", base_offset = wnd_game_offset, steps = {0x0514}, opcode = NOP},
-    chat_window         = { type = "opcode", base_offset = wnd_chat_offset, steps = {0xE8}, opcode = NOP},
+    chat_window         = { type = "opcode", base_offset = wnd_chat_offset, steps = {0xE8}, opcode = NOP, disable_opcode = CHAT_WINDOW_DISABLE_BRANCH},
     active_effects      = { type = "flag", base_offset = 0x4E37F4, steps = {0x14, 0x74C}},
     ability_bar         = { type = "flag", base_offset = 0x4E37F4, steps = {0x1C}}
 }
 
 local UI = {}
 
-local function NopInstruction(offset)
-    Util.WriteToOffset(offset, "uint32_t", NOP)
-end
-
-local function RestoreInstruction(offset, opcode)
+local function WriteInstruction(offset, opcode)
     Util.WriteToOffset(offset, "uint32_t", opcode)
 end
 
@@ -49,11 +67,16 @@ end
 local function DisableUIElement(ui_element)
     local offset = Util.GetOffsetFromPointerChain(ui_element.base_offset, ui_element.steps)
     if(ui_element.type == "opcode") then
+        -- Most elements are disabled by NOP'ing their draw instruction; some (e.g. chat_window)
+        -- need a specific replacement opcode instead.
+        local disable_opcode = ui_element.disable_opcode or NOP
         local curr_opcode = Util.ReadFromOffset(offset, "uint32_t")
-        if(curr_opcode ~= NOP) then
+        -- Only capture the original opcode if we're not already looking at a disabled state,
+        -- otherwise re-disabling would overwrite the saved original with our patch opcode.
+        if(curr_opcode ~= NOP and curr_opcode ~= disable_opcode) then
             ui_element.opcode = curr_opcode
         end
-        NopInstruction(offset)
+        WriteInstruction(offset, disable_opcode)
     elseif(ui_element.type == "flag") then
         DisableFlag(offset)
     end
@@ -62,7 +85,7 @@ end
 local function EnableUIElement(ui_element)
     local offset = Util.GetOffsetFromPointerChain(ui_element.base_offset, ui_element.steps)
     if(ui_element.type == "opcode" and ui_element.opcode ~= NOP) then
-        RestoreInstruction(offset, ui_element.opcode)
+        WriteInstruction(offset, ui_element.opcode)
     elseif(ui_element.type == "flag") then
         EnableFlag(offset)
     end
