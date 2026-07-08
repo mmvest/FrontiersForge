@@ -8,6 +8,11 @@ local Chat = require("frontiers_forge.chat")                -- Access chat messa
 local Ability = require("frontiers_forge.ability")         -- Ability record accessors + Scope enum
 local AbilityList = require("frontiers_forge.ability_list") -- Access abilities list
 local AbilityBar = require("frontiers_forge.ability_bar")   -- Access ability bar
+local Group = require("frontiers_forge.group")              -- Access group info
+
+local function NotInGameWarning()
+    ImGui.Text("(not in game - load a character to see this section)")
+end
 
 local function DisplayUtilFunctions()
     if ImGui.CollapsingHeader("Util Functions") then
@@ -78,6 +83,38 @@ local function DisplayUiFunctions()
         ImGui.SameLine()
         if ImGui.Button("Enable Target Nameplate") then
             UI.EnableTargetNameplate()
+        end
+
+        ImGui.Text("Group Display")
+        if ImGui.Button("Disable Group Member Panel") then
+            UI.DisableGroupMemberPanel()
+        end
+        ImGui.SameLine()
+        if ImGui.Button("Enable Group Member Panel") then
+            UI.EnableGroupMemberPanel()
+        end
+        if ImGui.Button("Disable Group Compass Markers") then
+            UI.DisableGroupCompassMarkers()
+        end
+        ImGui.SameLine()
+        if ImGui.Button("Enable Group Compass Markers") then
+            UI.EnableGroupCompassMarkers()
+        end
+        if ImGui.Button("Disable Group Display") then
+            UI.DisableGroupDisplay()
+        end
+        ImGui.SameLine()
+        if ImGui.Button("Enable Group Display") then
+            UI.EnableGroupDisplay()
+        end
+
+        ImGui.Text("Pet Panel")
+        if ImGui.Button("Disable Pet Panel") then
+            UI.DisablePetPanel()
+        end
+        ImGui.SameLine()
+        if ImGui.Button("Enable Pet Panel") then
+            UI.EnablePetPanel()
         end
 
         ImGui.Text("Active Effects Display")
@@ -306,6 +343,11 @@ demo_ability_state = demo_ability_state or {
 
 local function DisplayAbilityListFunctions()
     if ImGui.CollapsingHeader("AbilityList and Ability Functions") then
+        if Util.IsInGame() == 0 then
+            NotInGameWarning()
+            return
+        end
+
         -- AbilityList.GetCount(): how many abilities the player currently has
         local count = AbilityList.GetCount()
         ImGui.Text("AbilityList.GetCount(): " .. count)
@@ -348,6 +390,11 @@ end
 
 local function DisplayAbilityBarFunctions()
     if ImGui.CollapsingHeader("AbilityBar Functions") then
+        if Util.IsInGame() == 0 then
+            NotInGameWarning()
+            return
+        end
+
         -- The game keeps AbilityBar.num_bars (3) hotbars; bar 0 is the main
         -- ability bar. Each bar's live slot count can vary (bar 0: 5-9).
         ImGui.Text("AbilityBar.num_bars: " .. AbilityBar.num_bars)
@@ -386,6 +433,64 @@ local function DisplayAbilityBarFunctions()
     end
 end
 
+local function DisplayGroupMemberDetails(member)
+    ImGui.Text("GetEntityId: " .. member:GetEntityId())
+    ImGui.Text("GetName: " .. member:GetName())
+    ImGui.Text("IsActive: " .. tostring(member:IsActive()))
+
+    -- Health accessors return nil when the game doesn't currently know this
+    -- member's health.
+    local hp255 = member:GetHealthPercent255()
+    if hp255 == nil then
+        ImGui.Text("GetHealthPercent255: nil (health not known)")
+        ImGui.Text("GetHealthPercent: nil (health not known)")
+    else
+        ImGui.Text("GetHealthPercent255: " .. hp255)
+        ImGui.Text(string.format("GetHealthPercent: %.1f%%", member:GetHealthPercent()))
+    end
+
+    -- Last position the server reported. May be stale if the member's
+    -- entity isn't loaded nearby.
+    local coords = member:GetCoordinates()
+    ImGui.Text(string.format("GetCoordinates: x = %.2f, y = %.2f, z = %.2f", coords.x, coords.y, coords.z))
+end
+
+local function DisplayGroupFunctions()
+    if ImGui.CollapsingHeader("Group Functions") then
+        if Util.IsInGame() == 0 then
+            NotInGameWarning()
+            return
+        end
+
+        ImGui.Text("Group.IsInGroup(): " .. tostring(Group.IsInGroup()))
+        ImGui.Text("Group.IsSelfLeader(): " .. tostring(Group.IsSelfLeader()))
+
+        -- Member count includes yourself, and is 0 when not in a group.
+        local count = Group.GetMemberCount()
+        ImGui.Text("Group.GetMemberCount(): " .. count)
+
+        if count == 0 then
+            ImGui.Text("(join a group to see member examples)")
+            return
+        end
+
+        local first_member = Group.GetMemberByIndex(0)
+        if first_member and ImGui.TreeNode("Group.GetMemberByIndex(0): " .. first_member:GetName()) then
+            DisplayGroupMemberDetails(first_member)
+            ImGui.TreePop()
+        end
+
+        if ImGui.TreeNode("Group.Members() iterator") then
+            for index, member in Group.Members() do
+                if ImGui.TreeNode(index .. ". " .. member:GetName() .. " (ID: " .. member:GetEntityId() .. ")") then
+                    DisplayGroupMemberDetails(member)
+                    ImGui.TreePop()
+                end
+            end
+            ImGui.TreePop()
+        end
+    end
+end
 
 -- Begin a new ImGui window
 if ImGui.Begin("Frontiers Forge Test Window") then
@@ -407,6 +512,8 @@ if ImGui.Begin("Frontiers Forge Test Window") then
     DisplayAbilityListFunctions()
 
     DisplayAbilityBarFunctions()
+
+    DisplayGroupFunctions()
 end
 -- End the window
 ImGui.End()

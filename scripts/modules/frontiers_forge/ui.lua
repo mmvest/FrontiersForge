@@ -45,6 +45,10 @@ local ui_elements = {
     secondary_exp_bar   = { type = "opcode", base_offset = wnd_game_offset, steps = {0x03C0}, opcode = NOP},
     main_exp_bar        = { type = "opcode", base_offset = wnd_game_offset, steps = {0x03EC}, opcode = NOP},
     target_nameplate    = { type = "opcode", base_offset = wnd_game_offset, steps = {0x0514}, opcode = NOP},
+    group_member_panel  = { type = "opcode", base_offset = wnd_game_offset, steps = {0x0418}, opcode = NOP},
+    group_compass_marks = { type = "opcode", base_offset = wnd_game_offset, steps = {0x010C}, opcode = NOP},
+    -- The pet/henchman panel (name + health bar) drawn below the group member panel
+    pet_panel           = { type = "opcode", base_offset = wnd_game_offset, steps = {0x0464}, opcode = NOP},
     chat_window         = { type = "opcode", base_offset = wnd_chat_offset, steps = {0xE8}, opcode = NOP, disable_opcode = CHAT_WINDOW_DISABLE_BRANCH},
     active_effects      = { type = "flag", base_offset = 0x4E37F4, steps = {0x14, 0x74C}},
     ability_bar         = { type = "flag", base_offset = 0x4E37F4, steps = {0x1C}}
@@ -170,6 +174,51 @@ function UI.EnableTargetNameplate()
 end
 
 -- ╔═══════════════════════════════════════════════════════════════════════════╗
+-- ║                               Group Display                               ║
+-- ╚═══════════════════════════════════════════════════════════════════════════╝
+
+-- The panel listing group member names and health bars
+function UI.DisableGroupMemberPanel()
+    DisableUIElement(ui_elements.group_member_panel)
+end
+
+function UI.EnableGroupMemberPanel()
+    EnableUIElement(ui_elements.group_member_panel)
+end
+
+-- The colored group member position markers drawn around the compass
+function UI.DisableGroupCompassMarkers()
+    DisableUIElement(ui_elements.group_compass_marks)
+end
+
+function UI.EnableGroupCompassMarkers()
+    EnableUIElement(ui_elements.group_compass_marks)
+end
+
+-- Convenience wrappers to toggle all group UI at once
+function UI.DisableGroupDisplay()
+    UI.DisableGroupMemberPanel()
+    UI.DisableGroupCompassMarkers()
+end
+
+function UI.EnableGroupDisplay()
+    UI.EnableGroupMemberPanel()
+    UI.EnableGroupCompassMarkers()
+end
+
+-- ╔═══════════════════════════════════════════════════════════════════════════╗
+-- ║                                 Pet Panel                                  ║
+-- ╚═══════════════════════════════════════════════════════════════════════════╝
+
+function UI.DisablePetPanel()
+    DisableUIElement(ui_elements.pet_panel)
+end
+
+function UI.EnablePetPanel()
+    EnableUIElement(ui_elements.pet_panel)
+end
+
+-- ╔═══════════════════════════════════════════════════════════════════════════╗
 -- ║                              Active Effects                               ║
 -- ╚═══════════════════════════════════════════════════════════════════════════╝
 
@@ -211,6 +260,8 @@ function UI.DisableUI()
     UI.DisableExperienceBars()
     UI.DisableCompass()
     UI.DisableTargetNameplate()
+    UI.DisableGroupDisplay()
+    UI.DisablePetPanel()
     UI.DisableActiveEffectsDisplay()
     UI.DisableAbilityBar()
     UI.DisableChatWindow()
@@ -222,6 +273,8 @@ function UI.EnableUI()
     UI.EnableExperienceBars()
     UI.EnableCompass()
     UI.EnableTargetNameplate()
+    UI.EnableGroupDisplay()
+    UI.EnablePetPanel()
     UI.EnableActiveEffectsDisplay()
     UI.EnableAbilityBar()
     UI.EnableChatWindow()
