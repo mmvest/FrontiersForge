@@ -2,15 +2,22 @@ local Util = require("frontiers_forge.util")
 local AbilityList = require("frontiers_forge.ability_list")
 local ffi = require("ffi")
 
+-- Note that source_index is the RAW index into the ability list's record array.
+-- Index 0 is the list's null sentinel, so real abilities are always index >= 1.
 ffi.cdef[[
     typedef struct {
-        uint8_t unknown_00[0x04];   // byte 0 - 3
-        uint32_t ability_icon_ref;  // byte 4 - 7
-        uint8_t unknown_01[0x10];   // byte 8 - 23
-        uint32_t source_ref;        // byte 24 - 27     Ability List? this is a guess as of right now 
-        uint32_t source_index;      // byte 28 - 31     1-based (not 0-based) index into ability list
-    } AbilityBarSlot; 
+        int32_t  unknown_00;        // +0x00  always -1
+        int32_t  ability_icon_ref;  // +0x04  icon foreground ref (copied from ability +0x40), -1 if empty
+        int32_t  overlay_icon_ref;  // +0x08  0x3d overlay when ability flag_24 > 0, else -1
+        int32_t  unknown_0C;        // +0x0C  always -1
+        int32_t  unknown_10;        // +0x10  always -1
+        uint32_t unknown_14;        // +0x14  always 0
+        uint32_t source_type;       // +0x18  type tag: 0x8060000 = ability list, 0x2030000 = different container, 0 = empty
+        uint32_t source_index;      // +0x1C  raw index into the ability list array
+    } AbilityBarSlot;
 ]]
+
+local ABILITY_SOURCE_TAG = 0x8060000
 
 local AbilityBarSlot = {}
 AbilityBarSlot.__index = AbilityBarSlot
@@ -27,13 +34,20 @@ function AbilityBarSlot.new(address)
     return self
 end
 
+function AbilityBarSlot:IsEmpty()
+    return self.ptr.source_type == 0
+end
+
 function AbilityBarSlot:GetAbilityIndex()
-    return self.ptr.source_index - 1 -- the index is 1 based when the list is 0 based, so adjust it to be correct
+    if self.ptr.source_type ~= ABILITY_SOURCE_TAG then
+        return nil
+    end
+    return self.ptr.source_index
 end
 
 function AbilityBarSlot:GetAbility()
     local ability_index = self:GetAbilityIndex()
-    if ability_index >= 0 then
+    if ability_index and ability_index >= 1 then
         return AbilityList.GetAbilityByIndex(ability_index)
     end
     return nil
@@ -45,40 +59,62 @@ end
 
 local AbilityBar = {}
 AbilityBar.__index = AbilityBar
-AbilityBar.num_abilities = 5
+
+AbilityBar.num_bars = 3
 AbilityBar.slot_size = 0x20         -- 32 bytes
-AbilityBar.size = 0xA0              -- 160 bytes
-AbilityBar.base_offset = 0x1E93550
-AbilityBar.base_address = Util.EEmem() + AbilityBar.base_offset
 
+local FOCUSED_WINDOW_PTR_OFFSET = 0x4E37F4
+local bar_window_offsets = { [0] = 0x6B0, [1] = 0x6B4, [2] = 0x6B8 }
 
-function AbilityBar.GetAbilitySlot(bar_index, slot_index)
-    if bar_index < 0 or bar_index > 1 then
+-- Resolves the offset of a bar's config block, or nil if the UI windows
+-- aren't loaded yet (e.g. not in game).
+local function GetBarConfigOffset(bar_index)
+    if bar_index < 0 or bar_index >= AbilityBar.num_bars then
         error("Invalid bar index: " .. tostring(bar_index))
     end
 
-    if slot_index < 0 or slot_index >= AbilityBar.num_abilities then
+    if Util.ReadFromOffset(FOCUSED_WINDOW_PTR_OFFSET, "uint32_t") == 0 then
+        return nil
+    end
+
+    -- focused wnd -> parent (game UI root) -> VIWndHUDMenu wnd -> config ptr
+    local config_ptr_offset = Util.GetOffsetFromPointerChain(FOCUSED_WINDOW_PTR_OFFSET, {0x14, bar_window_offsets[bar_index], 0x24})
+    local config_offset = Util.ReadFromOffset(config_ptr_offset, "uint32_t")
+    if config_offset == 0 then
+        return nil
+    end
+    return config_offset
+end
+
+function AbilityBar.GetSlotCount(bar_index)
+    local config = GetBarConfigOffset(bar_index)
+    if config == nil then
+        return 0
+    end
+    return Util.ReadFromOffset(config + 0xC, "uint32_t")
+end
+
+function AbilityBar.GetAbilitySlot(bar_index, slot_index)
+    local config = GetBarConfigOffset(bar_index)
+    if config == nil then
+        return nil
+    end
+    if slot_index < 0 or slot_index >= AbilityBar.GetSlotCount(bar_index) then
         error("Invalid slot index: " .. tostring(slot_index))
     end
 
-    local bar_address = AbilityBar.base_address + (AbilityBar.size * bar_index)
-    local slot_address = bar_address + (AbilityBar.slot_size * slot_index)
+    local slots_offset = Util.ReadFromOffset(config + 0x8, "uint32_t")
+    local slot_address = Util.EEmem() + slots_offset + (AbilityBar.slot_size * slot_index)
 
     return AbilityBarSlot.new(slot_address)
 end
 
 function AbilityBar.GetAbility(bar_index, slot_index)
-    -- Hmm maybe there is a way to generalize these checks so that I can pull them into their own function
-    if bar_index < 0 or bar_index > 1 then
-        error("Invalid bar index: " .. tostring(bar_index))
+    local slot = AbilityBar.GetAbilitySlot(bar_index, slot_index)
+    if slot == nil then
+        return nil
     end
-
-    if slot_index < 0 or slot_index >= AbilityBar.num_abilities then
-        error("Invalid slot index: " .. tostring(slot_index))
-    end
-
-    return AbilityBar.GetAbilitySlot(bar_index, slot_index):GetAbility()
+    return slot:GetAbility()
 end
-
 
 return AbilityBar

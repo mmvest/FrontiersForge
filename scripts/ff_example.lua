@@ -5,6 +5,7 @@ local EntityList = require("frontiers_forge.entity_list") -- Access Entity List 
 local Input = require("frontiers_forge.input")       -- Access input variables
 local Camera = require("frontiers_forge.camera")     -- Access camera variables
 local Chat = require("frontiers_forge.chat")                -- Access chat messages
+local Ability = require("frontiers_forge.ability")         -- Ability record accessors + Scope enum
 local AbilityList = require("frontiers_forge.ability_list") -- Access abilities list
 local AbilityBar = require("frontiers_forge.ability_bar")   -- Access ability bar
 
@@ -267,46 +268,119 @@ local function DisplayChatFunctions()
     end
 end
 
+-- Reverse lookup for the Ability.Scope enum so we can show a friendly name
+local function GetScopeName(scope)
+    for name, value in pairs(Ability.Scope) do
+        if value == scope then
+            return name
+        end
+    end
+    return "UNKNOWN (" .. tostring(scope) .. ")"
+end
+
+-- Shows every accessor an Ability object provides
+local function DisplayAbilityDetails(ability)
+    ImGui.Text("IsValid: " .. tostring(ability:IsValid()))
+    ImGui.Text("GetId: " .. ability:GetId())
+    ImGui.Text("GetName: " .. ability:GetName())
+    ImGui.PushTextWrapPos(0.0)
+    ImGui.Text("GetDescription: " .. ability:GetDescription())
+    ImGui.PopTextWrapPos()
+    ImGui.Text("GetCategory: " .. ability:GetCategory())
+    ImGui.Text("GetSpellbookSlot: " .. ability:GetSpellbookSlot())
+    ImGui.Text("GetLevel: " .. ability:GetLevel())
+    ImGui.Text(string.format("GetRange: %.2f", ability:GetRange()))
+    ImGui.Text("GetCastTime: " .. ability:GetCastTime())
+    ImGui.Text("GetPwrCost: " .. ability:GetPwrCost())
+    ImGui.Text("GetIconBackgroundRef: " .. ability:GetIconBackgroundRef())
+    ImGui.Text("GetIconForegroundRef: " .. ability:GetIconForegroundRef())
+    ImGui.Text("GetScope: " .. ability:GetScope() .. " (" .. GetScopeName(ability:GetScope()) .. ")")
+    ImGui.Text("GetCooldown: " .. ability:GetCooldown())
+    ImGui.Text(string.format("GetEquipRequirements: 0x%02X (bitmask)", ability:GetEquipRequirements()))
+end
+
+demo_ability_state = demo_ability_state or {
+    index = 1,
+    id = 0
+}
+
 local function DisplayAbilityListFunctions()
     if ImGui.CollapsingHeader("AbilityList and Ability Functions") then
-        local index = 0 -- perhaps add functionality to be able to change which ability you get
-        local selected_ability = AbilityList.GetAbilityByIndex(index)
-        ImGui.Text("AbilityList.GetAbilityByIndex(" .. index .. "): ")
-        ImGui.Text("    Ability Name: " .. selected_ability:GetName())
-        ImGui.Text("    Description: " .. selected_ability:GetDescription())
-        ImGui.Text("    Ability Index: " .. selected_ability:GetIndex())
-        ImGui.Text("    Ability Level: " .. selected_ability:GetLevel())
-        ImGui.Text("    Ability Range: " .. selected_ability:GetRange())
-        ImGui.Text("    Cast Time: " .. selected_ability:GetCastTime())
-        ImGui.Text("    Power Cost: " .. selected_ability:GetPwrCost())
-        ImGui.Text("    Scope: " .. selected_ability:GetScope())
-        ImGui.Text("    Cooldown: " .. selected_ability:GetCooldown())
-        ImGui.Text("    Equip Requirements: " .. tostring(selected_ability:GetEquipRequirements()))
+        -- AbilityList.GetCount(): how many abilities the player currently has
+        local count = AbilityList.GetCount()
+        ImGui.Text("AbilityList.GetCount(): " .. count)
+
+        -- AbilityList.GetAbilityByIndex(index): raw array access.
+        -- Valid indices are 1 .. GetCount() (index 0 is the list's sentinel).
+        demo_ability_state.index = ImGui.SliderInt("index", demo_ability_state.index, 1, math.max(count, 1))
+        local selected_ability = AbilityList.GetAbilityByIndex(demo_ability_state.index)
+        if selected_ability and ImGui.TreeNode("AbilityList.GetAbilityByIndex(" .. demo_ability_state.index .. "): " .. selected_ability:GetName()) then
+            DisplayAbilityDetails(selected_ability)
+            ImGui.TreePop()
+        end
+
+        -- AbilityList.GetAbilityById(id): find an ability by its id
+        demo_ability_state.id = ImGui.InputInt("id", demo_ability_state.id)
+        local ability_by_id = AbilityList.GetAbilityById(demo_ability_state.id)
+        if ability_by_id == nil then
+            ImGui.Text("AbilityList.GetAbilityById(" .. demo_ability_state.id .. "): not found")
+        elseif ImGui.TreeNode("AbilityList.GetAbilityById(" .. demo_ability_state.id .. "): " .. ability_by_id:GetName()) then
+            DisplayAbilityDetails(ability_by_id)
+            ImGui.TreePop()
+        end
+
+        -- AbilityList.Abilities(): iterate every ability the player has,
+        -- in id-sorted order (same order the game itself enumerates them)
+        if ImGui.TreeNode("AbilityList.Abilities() iterator") then
+            for index, ability in AbilityList.Abilities() do
+                if ImGui.TreeNode(index .. ". " .. ability:GetName() .. " (ID: " .. ability:GetId() .. ")") then
+                    DisplayAbilityDetails(ability)
+                    ImGui.TreePop()
+                end
+            end
+            ImGui.TreePop()
+        end
     end
 end
 
 local function DisplayToolbeltFunctions()
 end
 
--- TODO: BROKEN
 local function DisplayAbilityBarFunctions()
     if ImGui.CollapsingHeader("AbilityBar Functions") then
-        for bar_index = 0, 1 do
-            ImGui.Text("Ability Bar " .. bar_index .. ":")
+        -- The game keeps AbilityBar.num_bars (3) hotbars; bar 0 is the main
+        -- ability bar. Each bar's live slot count can vary (bar 0: 5-9).
+        ImGui.Text("AbilityBar.num_bars: " .. AbilityBar.num_bars)
 
-            for slot_index = 0, AbilityBar.num_abilities - 1 do
-                local ability_slot = AbilityBar.GetAbilitySlot(bar_index, slot_index)
-                ImGui.Text("    AbilityBar.GetAbilitySlot(" .. slot_index .. "): ")
-                ImGui.Text("        AbilitySlot:GetIconRef(): " .. tostring(ability_slot:GetIconRef()))
-                ImGui.Text("        AbilitySlot:GetAbilityIndex(): " .. tostring(ability_slot:GetAbilityIndex()))
+        for bar_index = 0, AbilityBar.num_bars - 1 do
+            local slot_count = AbilityBar.GetSlotCount(bar_index)
+            if ImGui.TreeNode("Bar " .. bar_index .. " - AbilityBar.GetSlotCount(" .. bar_index .. "): " .. slot_count) then
+                for slot_index = 0, slot_count - 1 do
+                    local ability_slot = AbilityBar.GetAbilitySlot(bar_index, slot_index)
+                    if ImGui.TreeNode("AbilityBar.GetAbilitySlot(" .. bar_index .. ", " .. slot_index .. ")") then
+                        ImGui.Text("AbilitySlot:IsEmpty(): " .. tostring(ability_slot:IsEmpty()))
+                        ImGui.Text("AbilitySlot:GetIconRef(): " .. tostring(ability_slot:GetIconRef()))
+                        -- GetAbilityIndex() returns nil when the slot doesn't
+                        -- reference the player's ability list (empty slot or
+                        -- other source type)
+                        ImGui.Text("AbilitySlot:GetAbilityIndex(): " .. tostring(ability_slot:GetAbilityIndex()))
 
-                local ability = ability_slot:GetAbility()
-                if ability then
-                    ImGui.Text("        AbilitySlot:GetAbility(): ")
-                    ImGui.Text("            Ability:GetName(): " .. ability:GetName())
-                else
-                    ImGui.Text("            No Ability Found")
+                        -- AbilitySlot:GetAbility() resolves the slot into a full
+                        -- Ability object (see the Ability accessors above), and is
+                        -- also available as AbilityBar.GetAbility(bar, slot)
+                        local ability = ability_slot:GetAbility()
+                        if ability then
+                            if ImGui.TreeNode("AbilitySlot:GetAbility(): " .. ability:GetName()) then
+                                DisplayAbilityDetails(ability)
+                                ImGui.TreePop()
+                            end
+                        else
+                            ImGui.Text("AbilitySlot:GetAbility(): nil (empty slot)")
+                        end
+                        ImGui.TreePop()
+                    end
                 end
+                ImGui.TreePop()
             end
         end
     end

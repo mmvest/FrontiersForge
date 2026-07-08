@@ -1,27 +1,34 @@
 local ffi = require("ffi")
 local util = require("frontiers_forge.util")
 
+-- The player's abilities appear to live in a single array of these records
+-- with size 0x1D8. Index 0 is the null sentinel which is never a real ability.
 ffi.cdef[[
     typedef struct {
-        uint8_t unknown_00[0x10];       // byte   0 -  15 
-        uint32_t id;                    // byte  16 -  19
-        uint32_t id_repeat;             // byte  20 -  23
-        uint32_t index;                 // byte  24 -  27
-        uint8_t unknown_01[0x10];       // byte  28 -  43
-        uint32_t level;                 // byte  44 -  47
-        float range;                    // byte  48 -  51
-        uint32_t cast_time;             // byte  52 -  55
-        uint32_t pwr_cost;              // byte  56 -  59
-        uint32_t icon_bkgrnd_ref;       // byte  60 -  63
-        uint32_t icon_foregrnd_ref;     // byte  64 -  67
-        uint32_t scope;                 // byte  68 -  71
-        uint32_t cooldown;              // byte  72 -  75
-        uint32_t equip_req;             // byte  76 -  79
-        wchar_t name[0x02];             // byte  80 -  83   Don't know the actual length of the name
-        uint8_t unknown_02[0x7C];       // byte  84 - 207
-        wchar_t description[0x02];      // byte 208 - 211   Don't know the actual length of the description
-        uint8_t unknown_03[0x104];      // byte 212 - 472
-    } Ability; 
+        uint32_t tree_meta;             // +0x00  not really sure what this is
+        uint32_t parent_index;          // +0x04  parent node index (0 = none)
+        uint32_t left_index;            // +0x08  left child index (0 = none)
+        uint32_t right_index;           // +0x0C  right child index (0 = none)
+        uint32_t id;                    // +0x10  ability id (tree key)
+        uint32_t unknown_14;            // +0x14
+        uint32_t category;              // +0x18  0xFC and above = special/inventory?
+        uint32_t valid;                 // +0x1C  nonzero when this record holds a real ability?
+        uint32_t spellbook_slot;        // +0x20  spellbook position; 0-4 also appear on the hotbar,
+                                        //        0xFC-0xFF are the specific items placed in hotbar slots 5-8
+        int32_t  flag_24;               // +0x24  >0 draws an overlay icon (0x3d) on the hotbar slot?
+        uint32_t unknown_28;            // +0x28
+        uint32_t level;                 // +0x2C
+        float    range;                 // +0x30
+        uint32_t cast_time;             // +0x34
+        uint32_t pwr_cost;              // +0x38
+        uint32_t icon_bkgrnd_ref;       // +0x3C
+        uint32_t icon_foregrnd_ref;     // +0x40
+        uint32_t scope;                 // +0x44
+        uint32_t cooldown;              // +0x48
+        uint32_t equip_req;             // +0x4C  bitmask
+        wchar_t name[64];               // +0x50
+        wchar_t description[132];       // +0xD0
+    } Ability;
 ]]
 
 local Ability = {}
@@ -37,7 +44,7 @@ Ability.Scope = {
     UNKNOWN = 5
 }
 
-Ability.size = 0x1D8  -- This is my best estimate for now -- hopefully correct
+Ability.size = 0x1D8
 
 function Ability.new(address)
     if type(address) == "number" then
@@ -51,8 +58,20 @@ function Ability.new(address)
     return self
 end
 
-function Ability:GetIndex()
-    return self.ptr.index
+function Ability:IsValid()
+    return self.ptr.valid ~= 0
+end
+
+function Ability:GetId()
+    return self.ptr.id
+end
+
+function Ability:GetCategory()
+    return self.ptr.category
+end
+
+function Ability:GetSpellbookSlot()
+    return self.ptr.spellbook_slot
 end
 
 function Ability:GetLevel()
@@ -69,6 +88,14 @@ end
 
 function Ability:GetPwrCost()
     return self.ptr.pwr_cost
+end
+
+function Ability:GetIconBackgroundRef()
+    return self.ptr.icon_bkgrnd_ref
+end
+
+function Ability:GetIconForegroundRef()
+    return self.ptr.icon_foregrnd_ref
 end
 
 function Ability:GetScope()
