@@ -34,10 +34,13 @@ function AbilityBarSlot.new(address)
     return self
 end
 
+--- @return boolean empty True when nothing is assigned to this slot.
 function AbilityBarSlot:IsEmpty()
     return self.ptr.source_type == 0
 end
 
+--- Raw ability list index this slot points at.
+--- @return integer|nil index Raw index into the ability list, or nil when the slot does not reference the ability list.
 function AbilityBarSlot:GetAbilityIndex()
     if self.ptr.source_type ~= ABILITY_SOURCE_TAG then
         return nil
@@ -45,6 +48,8 @@ function AbilityBarSlot:GetAbilityIndex()
     return self.ptr.source_index
 end
 
+--- Resolves the slot into a full Ability object.
+--- @return table|nil ability Ability object for this slot, or nil when the slot is empty or not ability sourced.
 function AbilityBarSlot:GetAbility()
     local ability_index = self:GetAbilityIndex()
     if ability_index and ability_index >= 1 then
@@ -53,6 +58,7 @@ function AbilityBarSlot:GetAbility()
     return nil
 end
 
+--- @return integer icon_ref Icon reference drawn in this slot, or -1 when empty.
 function AbilityBarSlot:GetIconRef()
     return self.ptr.ability_icon_ref
 end
@@ -73,19 +79,16 @@ local function GetBarConfigOffset(bar_index)
         error("Invalid bar index: " .. tostring(bar_index))
     end
 
-    if Util.ReadFromOffset(FOCUSED_WINDOW_PTR_OFFSET, "uint32_t") == 0 then
-        return nil
-    end
-
-    -- focused wnd -> parent (game UI root) -> VIWndHUDMenu wnd -> config ptr
-    local config_ptr_offset = Util.GetOffsetFromPointerChain(FOCUSED_WINDOW_PTR_OFFSET, {0x14, bar_window_offsets[bar_index], 0x24})
-    local config_offset = Util.ReadFromOffset(config_ptr_offset, "uint32_t")
+    local config_offset = Util.ReadFromPointerChain(FOCUSED_WINDOW_PTR_OFFSET, {0x14, bar_window_offsets[bar_index], 0x24}, "uint32_t", 0)
     if config_offset == 0 then
         return nil
     end
     return config_offset
 end
 
+--- Number of slots currently on a bar.
+--- @param bar_index integer Bar index from 0 to AbilityBar.num_bars - 1.
+--- @return integer count Live slot count, or 0 when the UI windows are not loaded (e.g. not in game).
 function AbilityBar.GetSlotCount(bar_index)
     local config = GetBarConfigOffset(bar_index)
     if config == nil then
@@ -94,6 +97,10 @@ function AbilityBar.GetSlotCount(bar_index)
     return Util.ReadFromOffset(config + 0xC, "uint32_t")
 end
 
+--- Get a slot object from a bar.
+--- @param bar_index integer Bar index from 0 to AbilityBar.num_bars - 1.
+--- @param slot_index integer Slot index from 0 to GetSlotCount(bar_index) - 1.
+--- @return table|nil slot AbilityBarSlot object, or nil when the UI windows are not loaded.
 function AbilityBar.GetAbilitySlot(bar_index, slot_index)
     local config = GetBarConfigOffset(bar_index)
     if config == nil then
@@ -109,6 +116,10 @@ function AbilityBar.GetAbilitySlot(bar_index, slot_index)
     return AbilityBarSlot.new(slot_address)
 end
 
+--- Convenience wrapper resolving a bar slot straight to an Ability object.
+--- @param bar_index integer Bar index from 0 to AbilityBar.num_bars - 1.
+--- @param slot_index integer Slot index from 0 to GetSlotCount(bar_index) - 1.
+--- @return table|nil ability Ability object, or nil when the slot is empty, not ability sourced, or the UI is not loaded.
 function AbilityBar.GetAbility(bar_index, slot_index)
     local slot = AbilityBar.GetAbilitySlot(bar_index, slot_index)
     if slot == nil then

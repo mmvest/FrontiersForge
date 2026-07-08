@@ -53,16 +53,18 @@ function GroupMember.new(address)
     return self
 end
 
+--- @return integer entity_id The member's entity id.
 function GroupMember:GetEntityId()
     return self.ptr.entity_id
 end
 
+--- @return string name The member's character name.
 function GroupMember:GetName()
     return ffi.string(self.ptr.name)
 end
 
--- Health percent as 0-255, matching how the game stores it. Returns nil when
--- the game doesn't currently know this member's health.
+--- Health percent as 0-255, matching how the game stores it.
+--- @return integer|nil percent_hp Health from 0 to 255, or nil when the game does not currently know this member's health.
 function GroupMember:GetHealthPercent255()
     if self.ptr.hp_known == 0 then
         return nil
@@ -70,7 +72,8 @@ function GroupMember:GetHealthPercent255()
     return self.ptr.percent_hp
 end
 
--- Convenience wrapper returning 0-100
+--- Convenience wrapper returning health on a 0 to 100 scale.
+--- @return number|nil percent_hp Health from 0 to 100, or nil when the game does not currently know this member's health.
 function GroupMember:GetHealthPercent()
     local hp = self:GetHealthPercent255()
     if hp == nil then
@@ -79,49 +82,62 @@ function GroupMember:GetHealthPercent()
     return (hp / 255) * 100
 end
 
+--- @return boolean active True when this slot is shown in the group panel.
 function GroupMember:IsActive()
     return self.ptr.active ~= 0
 end
 
--- Last known position the server sent for this member.
+--- Last known position the server sent for this member.
+--- @return table coordinates Table with fields x, y, and z.
 function GroupMember:GetCoordinates()
     return { x = self.ptr.x, y = self.ptr.y, z = self.ptr.z }
 end
 
 local Group = {}
 
-local function ResolveOffset(step)
-    return Util.GetOffsetFromPointerChain(GUI_CONTEXT_PTR_OFFSET, {step})
+-- Reads a group field via the pointer chain, returning `default` when the
+-- chain can't be resolved (e.g. not in game).
+local function ReadGroupField(step, default)
+    return Util.ReadFromPointerChain(GUI_CONTEXT_PTR_OFFSET, {step}, "uint32_t", default)
 end
 
+--- @return boolean in_group True when the player is currently in a group.
 function Group.IsInGroup()
-    return Util.ReadFromOffset(ResolveOffset(IN_GROUP_STEP), "uint32_t") ~= 0
+    return ReadGroupField(IN_GROUP_STEP, 0) ~= 0
 end
 
+--- @return boolean is_leader True when the player is the group leader.
 function Group.IsSelfLeader()
-    return Util.ReadFromOffset(ResolveOffset(IS_LEADER_STEP), "uint32_t") ~= 0
+    return ReadGroupField(IS_LEADER_STEP, 0) ~= 0
 end
 
--- Number of member records, INCLUDING the local player. Returns 0 when not
--- in a group.
+--- Number of member records, INCLUDING the local player.
+--- @return integer count Member count, or 0 when not in a group or not in game.
 function Group.GetMemberCount()
     if not Group.IsInGroup() then
         return 0
     end
-    return Util.ReadFromOffset(ResolveOffset(MEMBER_COUNT_STEP), "uint32_t")
+    return ReadGroupField(MEMBER_COUNT_STEP, 0)
 end
 
--- Get a member record by index (0 .. GetMemberCount()-1), or nil.
+--- Get a member record by index.
+--- @param index integer Member index from 0 to GetMemberCount() - 1.
+--- @return table|nil member GroupMember object, or nil when the index is out of range or the group data is not loaded.
 function Group.GetMemberByIndex(index)
     if index < 0 or index >= Group.GetMemberCount() then
         return nil
     end
-    local address = Util.EEmem() + ResolveOffset(MEMBERS_STEP) + (index * MEMBER_SIZE)
+    local members_offset = Util.GetOffsetFromPointerChain(GUI_CONTEXT_PTR_OFFSET, {MEMBERS_STEP})
+    if members_offset == nil then
+        return nil
+    end
+    local address = Util.EEmem() + members_offset + (index * MEMBER_SIZE)
     return GroupMember.new(address)
 end
 
--- Iterator over all members:
---   for index, member in Group.Members() do ... end
+--- Iterator over all members.
+--- Usage looks like `for index, member in Group.Members() do ... end`.
+--- @return function iterator Iterator producing member index and GroupMember object pairs.
 function Group.Members()
     local index = -1
     return function()

@@ -78,16 +78,24 @@ local ee_mem = tonumber(ffi.C.EEmem)
 
 local Util = {}
 
+--- @return integer base_address The emulated PS2 memory base address in host memory.
 function Util.EEmem()
     return ee_mem
 end
 
--- Function to read a value from EEmem + offset
+--- Reads a value of the given ctype from EEmem plus offset.
+--- @param offset integer Offset from EEmem to read from.
+--- @param ctype string The ctype to read (e.g. "uint32_t").
+--- @return any value The value read at that offset.
 function Util.ReadFromOffset(offset, ctype)
     local ptr = ffi.cast(ctype .. "*", ee_mem + offset)
     return ptr[0]
 end
 
+--- Writes a value of the given ctype to EEmem plus offset.
+--- @param offset integer Offset from EEmem to write to.
+--- @param ctype string The ctype to write (e.g. "uint32_t").
+--- @param value any The value to write.
 function Util.WriteToOffset(offset, ctype, value)
     local ptr = ffi.cast(ctype .. "*", Util.EEmem() + offset)
     ptr[0] = value
@@ -108,20 +116,45 @@ end
 --   We return 0026CE38
 -- base_offset in this case is 0x4FA500
 -- steps is { 0x25C, 0x684, 0x1F8 }
+--- If any pointer in the chain reads as null, we return nil rather than chasing
+--- a bogus address.
 --- @param base_offset integer Base offset from EEMem to start traversal from.
 --- @param steps integer[] Ordered pointer-chain step values to add between reads.
---- @return integer target_offset Final resolved offset after all chain steps.
+--- @return integer|nil target_offset Final resolved offset, or nil if the chain hit a null pointer.
 function Util.GetOffsetFromPointerChain(base_offset, steps)
     local target_offset = base_offset
     for idx, step in ipairs(steps) do
-        target_offset = Util.ReadFromOffset(target_offset, "uint32_t") + step
+        local ptr = Util.ReadFromOffset(target_offset, "uint32_t")
+        if ptr == 0 then
+            return nil
+        end
+        target_offset = ptr + step
     end
 
     return target_offset
 end
 
--- UTF-16 to UTF-8 conversion using WideCharToMultiByte
--- Assumes null-terminated string
+-- Convenience wrapper to resolve a pointer chain and read the value at the end,
+-- returning `default` if the chain hits a null pointer. Saves callers from repeating
+-- the nil check required by the updated GetOffsetFromPointerChain now returning nil
+-- when encountering a null pointer.
+--- @param base_offset integer Base offset from EEMem to start traversal from.
+--- @param steps integer[] Ordered pointer-chain step values.
+--- @param ctype string The ctype to read at the resolved offset (e.g. "uint32_t").
+--- @param default any Value to return if the chain hits a null pointer.
+--- @return any value The value read, or `default` if the chain was broken.
+function Util.ReadFromPointerChain(base_offset, steps, ctype, default)
+    local offset = Util.GetOffsetFromPointerChain(base_offset, steps)
+    if offset == nil then
+        return default
+    end
+    return Util.ReadFromOffset(offset, ctype)
+end
+
+--- UTF-16 to UTF-8 conversion using WideCharToMultiByte.
+--- Assumes a null terminated string. Errors when the conversion fails.
+--- @param utf16_ptr cdata Pointer to a null terminated wchar_t string.
+--- @return string utf8_str The converted UTF-8 Lua string.
 function Util.utf16_to_utf8(utf16_ptr)
     -- Calculate the required buffer size for the UTF-8 string
     local utf8_len = ffi.C.WideCharToMultiByte(
@@ -150,6 +183,10 @@ function Util.utf16_to_utf8(utf16_ptr)
     return ffi.string(utf8_str)
 end
 
+--- UTF-8 to UTF-16 conversion using MultiByteToWideChar.
+--- Errors when the conversion fails.
+--- @param utf8_str string UTF-8 string to convert. nil becomes an empty string.
+--- @return cdata wide_buf Null terminated wchar_t buffer holding the UTF-16 string.
 function Util.utf8_to_utf16(utf8_str)
     utf8_str = tostring(utf8_str or "")
 
@@ -177,40 +214,58 @@ function Util.utf8_to_utf16(utf8_str)
     return wide_buf
 end
 
+--- Total experience required to reach the next level from the given level.
+--- @param level integer Character level from 1 to 59.
+--- @return integer|nil exp Experience required, or nil for levels outside the table.
 function Util.GetExpRequiredForLevel(level)
     return exp_for_levels[level]
 end
 
+--- Tests whether the bits selected by mask are all zero in value.
+--- @param value integer Value to test.
+--- @param mask integer Bit mask to apply.
+--- @return boolean is_zero True when value AND mask equals zero.
 function Util.IsBitZero(value, mask)
-    
+
     return bit.band(value, mask) == 0
 end
 
+--- @param radians number Angle in radians.
+--- @return number degrees Angle in degrees.
 function Util.RadiansToDegrees(radians)
     return radians * (180 / math.pi)
 end
 
+--- Whether the player is currently in the game world.
+--- @return integer in_game Nonzero when in game, 0 otherwise.
 function Util.IsInGame()
     local is_in_game_offset = 0x1FDB480
     return Util.ReadFromOffset(is_in_game_offset, "uint8_t")
 end
 
+--- Whether the start menu is currently open.
+--- @return integer is_open Nonzero when the start menu is open, 0 otherwise or when not in game.
 function Util.IsStartMenuOpen()
-    local is_start_menu_open_offset = Util.GetOffsetFromPointerChain(0x14E200, {0x15C, 0x53C, 0x8, 0x88, 0x24})
-    return Util.ReadFromOffset(is_start_menu_open_offset, "uint8_t")
+    return Util.ReadFromPointerChain(0x14E200, {0x15C, 0x53C, 0x8, 0x88, 0x24}, "uint8_t", 0)
 end
 
--- Retrieve the player's compass heading in radians
+--- Retrieve the player's compass heading in radians.
+--- @return number radians Compass heading in radians.
 function Util.GetCompassRadians()
     local compass_heading_offset = 0x1FB66AC
     return Util.ReadFromOffset(compass_heading_offset, "float")
 end
 
--- Convenience wrapper to get compass heading in degrees
+--- Convenience wrapper to get compass heading in degrees.
+--- @return number degrees Compass heading in degrees.
 function Util.GetCompassDegrees()
     return Util.RadiansToDegrees(Util.GetCompassRadians())
 end
 
+--- Lists files matching a Windows wildcard pattern. Directories are skipped.
+--- @param pattern string Windows path pattern (e.g. "scripts\\*.lua").
+--- @param options table|nil Optional table with full_path boolean and base_dir string used to prefix results.
+--- @return string[] results Array of file names, or full paths when options.full_path is true. Empty when nothing matches.
 function Util.ListFiles(pattern, options)
     options = options or {}
 
@@ -253,6 +308,11 @@ function Util.ListFiles(pattern, options)
     return results
 end
 
+--- Convenience wrapper listing files in a directory that match a glob.
+--- @param dir string Directory to search.
+--- @param glob string|nil Wildcard to match, defaults to "*".
+--- @param options table|nil Same options as ListFiles. full_path uses dir as the prefix when base_dir is not set.
+--- @return string[] results Array of file names, or full paths when options.full_path is true. Empty when nothing matches.
 function Util.ListFilesInDir(dir, glob, options)
     dir = tostring(dir or "")
     glob = tostring(glob or "*")

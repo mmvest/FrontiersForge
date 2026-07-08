@@ -23,23 +23,31 @@ typedef struct
 
 local Chat = {}
 
-local chat_log_offset       = Util.GetOffsetFromPointerChain(0x14E200, {0x178, 0x654, 0x688, 0x1A8})
 local chat_log_size         = 32
-local chat_log = ffi.cast("chat_log*", Util.EEmem() + chat_log_offset)
 
-local function GetHeadIndex()
+-- Resolve the chat log lazily. The chat log doesn't exist until in game, and the chain
+-- will return nil until then. Returns a cast chat_log* or nil.
+local function GetChatLog()
+    local chat_log_offset = Util.GetOffsetFromPointerChain(0x14E200, {0x178, 0x654, 0x688, 0x1A8})
+    if chat_log_offset == nil then
+        return nil
+    end
+    return ffi.cast("chat_log*", Util.EEmem() + chat_log_offset)
+end
+
+local function GetHeadIndex(chat_log)
     return chat_log.head_index
 end
 
-local function GetMessageID(index)
+local function GetMessageID(chat_log, index)
     return chat_log.messages[index].id
 end
 
-local function GetMessageDataAsString(index)
+local function GetMessageDataAsString(chat_log, index)
     return Util.utf16_to_utf8(chat_log.messages[index].data)
 end
 
-local function GetMessageType(index)
+local function GetMessageType(chat_log, index)
     return chat_log.messages[index].type
 end
 
@@ -60,16 +68,25 @@ Chat.MsgType = {
 -- track last-returned message id so GetNextMessage() is non-blocking
 local last_returned_id = 0
 
+--- Non-blocking poll for the newest chat message. Returns each message once,
+--- then returns an empty string until a new message arrives.
+--- @return string msg_contents Full message text, or an empty string when there is nothing new.
+--- @return integer msg_type Message type value, see Chat.MsgType. 0 when there is nothing new.
 function Chat.GetNextMessage()
+    local chat_log = GetChatLog()
+    if chat_log == nil then
+        return "", 0
+    end
+
     -- Get the current head index.
-    local head_index = GetHeadIndex()
+    local head_index = GetHeadIndex(chat_log)
 
     -- Go to the previous index since head index points to the next
     -- slot to write over.
     local last_msg_index = AdjustIndex(head_index, -1)
 
     -- Grab the message ID
-    local last_msg_id = GetMessageID(last_msg_index)
+    local last_msg_id = GetMessageID(chat_log, last_msg_index)
 
     -- If nothing has changed, return empty string (non-blocking)
     if last_msg_id == 0 or last_msg_id == last_returned_id then
@@ -86,7 +103,7 @@ function Chat.GetNextMessage()
     local steps = 0
     while last_msg_id == temp_msg_id and steps < chat_log_size do
         temp_msg_index = AdjustIndex(temp_msg_index, -1)
-        temp_msg_id = GetMessageID(temp_msg_index)
+        temp_msg_id = GetMessageID(chat_log, temp_msg_index)
         steps = steps + 1
     end
 
@@ -98,13 +115,13 @@ function Chat.GetNextMessage()
 
     -- Move to the first struct of the current message
     last_msg_index = AdjustIndex(temp_msg_index, 1)
-    local msg_type = GetMessageType(last_msg_index)
+    local msg_type = GetMessageType(chat_log, last_msg_index)
 
     -- Concatenate message chunks up to head_index, but cap again for safety
     local msg_contents = ""
     steps = 0
     while last_msg_index ~= head_index and steps < chat_log_size do
-        msg_contents = msg_contents .. GetMessageDataAsString(last_msg_index)
+        msg_contents = msg_contents .. GetMessageDataAsString(chat_log, last_msg_index)
         last_msg_index = AdjustIndex(last_msg_index, 1)
         steps = steps + 1
     end
@@ -113,6 +130,9 @@ function Chat.GetNextMessage()
     return msg_contents, msg_type
 end
 
+--- Converts a message type value into a readable name.
+--- @param msg_type integer Message type value as returned by GetNextMessage.
+--- @return string name One of "Say", "Shout", "Party", "Tell", "Guild", or "Unknown Message Type".
 function Chat.GetMessageTypeString(msg_type)
     if msg_type == Chat.MsgType.Shout   then return "Shout" end
     if msg_type == Chat.MsgType.Say     then return "Say"   end

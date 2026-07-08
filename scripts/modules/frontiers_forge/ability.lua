@@ -46,6 +46,9 @@ Ability.Scope = {
 
 Ability.size = 0x1D8
 
+--- Wraps a raw ability record address in an Ability object.
+--- @param address integer|ffi.cdata* Host address of the record, either a number or an Ability pointer.
+--- @return table ability New Ability object backed by the record at the given address.
 function Ability.new(address)
     if type(address) == "number" then
         address = ffi.cast("Ability*", address)
@@ -58,62 +61,77 @@ function Ability.new(address)
     return self
 end
 
+--- @return boolean valid True when this record holds a real ability.
 function Ability:IsValid()
     return self.ptr.valid ~= 0
 end
 
+--- @return integer id The ability id, which is also the tree key.
 function Ability:GetId()
     return self.ptr.id
 end
 
+--- @return integer category Category code. Values 0xFC and above appear to be special or inventory entries.
 function Ability:GetCategory()
     return self.ptr.category
 end
 
+--- @return integer slot Spellbook sort position. Values 0xFC to 0xFF are items placed in hotbar slots 5 to 8.
 function Ability:GetSpellbookSlot()
     return self.ptr.spellbook_slot
 end
 
+--- @return integer level Level required to use the ability.
 function Ability:GetLevel()
     return self.ptr.level
 end
 
+--- @return number range The ability range as a float.
 function Ability:GetRange()
     return self.ptr.range
 end
 
+--- @return integer cast_time Cast time value as stored by the game.
 function Ability:GetCastTime()
     return self.ptr.cast_time
 end
 
+--- @return integer pwr_cost Power cost to use the ability.
 function Ability:GetPwrCost()
     return self.ptr.pwr_cost
 end
 
+--- @return integer icon_ref Icon reference for the icon background.
 function Ability:GetIconBackgroundRef()
     return self.ptr.icon_bkgrnd_ref
 end
 
+--- @return integer icon_ref Icon reference for the icon foreground.
 function Ability:GetIconForegroundRef()
     return self.ptr.icon_foregrnd_ref
 end
 
+--- @return integer scope Target scope value, see Ability.Scope for known values.
 function Ability:GetScope()
     return self.ptr.scope
 end
 
+--- @return integer cooldown Recast time value as stored by the game.
 function Ability:GetCooldown()
     return self.ptr.cooldown
 end
 
+--- @return integer equip_req Equipment requirement bitmask.
 function Ability:GetEquipRequirements()
     return self.ptr.equip_req
 end
 
+--- @return string name The ability name converted to UTF-8.
 function Ability:GetName()
     return util.utf16_to_utf8(self.ptr.name)
 end
 
+--- @return string description The ability description converted to UTF-8.
 function Ability:GetDescription()
     return util.utf16_to_utf8(self.ptr.description)
 end

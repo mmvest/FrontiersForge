@@ -9,6 +9,7 @@ local Ability = require("frontiers_forge.ability")         -- Ability record acc
 local AbilityList = require("frontiers_forge.ability_list") -- Access abilities list
 local AbilityBar = require("frontiers_forge.ability_bar")   -- Access ability bar
 local Group = require("frontiers_forge.group")              -- Access group info
+local Combat = require("frontiers_forge.combat")             -- Combat event hook (damage/heal capture)
 
 local function NotInGameWarning()
     ImGui.Text("(not in game - load a character to see this section)")
@@ -197,38 +198,59 @@ local function DisplayPlayerFunctions()
         ImGui.Text(string.format("GetCoordinates: x = %.2f, y = %.2f, z = %.2f", coords.x, coords.y, coords.z))
         
         ImGui.Text("GetTargetEntityId: " .. Player.GetTargetEntityId())
+        local target = EntityList.GetEntityById(Player.GetTargetEntityId())
+        if target ~= nil then
+            ImGui.Text("Current target:")
+            ImGui.Text("  Name: " .. target.name)
+            ImGui.Text("  ID: " .. target.id)
+            ImGui.Text("  Level: " .. target.level)
+            ImGui.Text("  HP: " .. target.percent_hp .. "%")
+            ImGui.Text(string.format("  Coordinates: x = %.2f, y = %.2f, z = %.2f", target.x, target.y, target.z))
+            ImGui.Text("  Disposition: " .. tostring(target.disposition)
+                .. " (" .. tostring(target.disposition_name) .. ")")
+        else
+            ImGui.Text("Current target: (nothing targeted)")
+        end
     end
+end
+
+local function DisplayEntityDetails(entity)
+    ImGui.Text("Name: " .. entity.name)
+    ImGui.Text("ID: " .. entity.id)
+    ImGui.Text("Level: " .. entity.level)
+    ImGui.Text("HP: " .. entity.percent_hp .. "%")
+    ImGui.Text(string.format("Coordinates: x = %.2f, y = %.2f, z = %.2f", entity.x, entity.y, entity.z))
+
+    -- Disposition towards the player. The server only sends this
+    -- for the CURRENT TARGET, so every other entity shows nil / "Unknown".
+    ImGui.Text("Disposition: " .. tostring(entity.disposition)
+        .. " (" .. tostring(entity.disposition_name) .. ")")
 end
 
 local function DisplayEntityListFunctions()
     if ImGui.CollapsingHeader("Entity List Functions") then
         local entity = EntityList.GetEntityById(Player.GetTargetEntityId())
         if entity == nil then
-            entity = { id = 0, percent_hp = 0, x = 0, y = 0, z = 0, name = "No entity selected", level = 0 }
+            entity = { id = 0, percent_hp = 0, x = 0, y = 0, z = 0, name = "No entity selected", level = 0,
+                       disposition = nil, disposition_name = EntityList.GetDispositionName(nil) }
         end
         if ImGui.TreeNode("GetEntityById: " .. entity.name .. " (ID: " .. entity.id .. ")") then
-            -- Inside the tree node, show the entity stats
-            ImGui.Text("Name: " .. entity.name)
-            ImGui.Text("ID: " .. entity.id)
-            ImGui.Text("Level: " .. entity.level)
-            ImGui.Text("HP: " .. entity.percent_hp .. "%")
-            ImGui.Text(string.format("Coordinates: x = %.2f, y = %.2f, z = %.2f", entity.x, entity.y, entity.z))
+            -- Inside the tree node, show the entity stats. The current target
+            -- is the one entity whose disposition is populated.
+            DisplayEntityDetails(entity)
 
             -- End the tree node
             ImGui.TreePop()
         end
-        
+
         entity = EntityList.GetEntityByIndex(0)
         if entity == nil then
-            entity = { id = 0, percent_hp = 0, x = 0, y = 0, z = 0, name = "No entity", level = 0 }
+            entity = { id = 0, percent_hp = 0, x = 0, y = 0, z = 0, name = "No entity", level = 0,
+                       disposition = nil, disposition_name = EntityList.GetDispositionName(nil) }
         end
         if ImGui.TreeNode("GetEntityByIndex: " .. entity.name .. " (ID: " .. entity.id .. ")") then
             -- Inside the tree node, show the entity stats
-            ImGui.Text("Name: " .. entity.name)
-            ImGui.Text("ID: " .. entity.id)
-            ImGui.Text("Level: " .. entity.level)
-            ImGui.Text("HP: " .. entity.percent_hp .. "%")
-            ImGui.Text(string.format("Coordinates: x = %.2f, y = %.2f, z = %.2f", entity.x, entity.y, entity.z))
+            DisplayEntityDetails(entity)
 
             -- End the tree node
             ImGui.TreePop()
@@ -236,18 +258,15 @@ local function DisplayEntityListFunctions()
 
         local entities = EntityList.GetAllEntities()
         if entities == nil then
-            entities = {{ id = 0, percent_hp = 0, x = 0, y = 0, z = 0, name = "No entities around", level = 0 }}
+            entities = {{ id = 0, percent_hp = 0, x = 0, y = 0, z = 0, name = "No entities around", level = 0,
+                          disposition = nil, disposition_name = EntityList.GetDispositionName(nil) }}
         end
         for index = 1, #entities do
             entity = entities[index]
             -- Display the tree node with the entity name and ID
             if ImGui.TreeNode(index .. ". " ..entity.name .. " (ID: " .. entity.id .. ")") then
                 -- Inside the tree node, show the entity stats
-                ImGui.Text("Name: " .. entity.name)
-                ImGui.Text("ID: " .. entity.id)
-                ImGui.Text("Level: " .. entity.level)
-                ImGui.Text("HP: " .. entity.percent_hp .. "%")
-                ImGui.Text(string.format("Coordinates: x = %.2f, y = %.2f, z = %.2f", entity.x, entity.y, entity.z))
+                DisplayEntityDetails(entity)
 
                 -- End the tree node
                 ImGui.TreePop()
@@ -492,6 +511,88 @@ local function DisplayGroupFunctions()
     end
 end
 
+ff_combat_meter = ff_combat_meter or {
+    damage_dealt = 0,
+    damage_taken = 0,
+    healing_received = 0,
+    hits_dealt = 0,
+    hits_taken = 0,
+    log = {},
+}
+
+local function DisplayCombatFunctions()
+    -- Poll every frame while the hook is up, even when the header is
+    -- collapsed, so the 64-entry ring buffer never overruns.
+    local meter = ff_combat_meter
+    if Combat.IsHookInstalled() then
+        for _, event in ipairs(Combat.PollEvents()) do
+            if event.is_heal then
+                if event.incoming then
+                    meter.healing_received = meter.healing_received + event.amount
+                end
+            elseif event.outgoing then
+                meter.damage_dealt = meter.damage_dealt - event.amount
+                meter.hits_dealt = meter.hits_dealt + 1
+            elseif event.incoming then
+                meter.damage_taken = meter.damage_taken - event.amount
+                meter.hits_taken = meter.hits_taken + 1
+            end
+            meter.log[#meter.log + 1] = string.format(
+                "#%d  attacker=%d  defender=%d  amount=%d%s",
+                event.seq, event.attacker_id, event.defender_id, event.amount,
+                event.is_heal and "  (heal)" or "")
+            if #meter.log > 20 then
+                table.remove(meter.log, 1)
+            end
+        end
+    end
+
+    if ImGui.CollapsingHeader("Combat Functions") then
+        if Util.IsInGame() == 0 then
+            NotInGameWarning()
+            return
+        end
+
+        ImGui.Text("Combat.IsHookInstalled(): " .. tostring(Combat.IsHookInstalled()))
+        if not Combat.IsHookInstalled() then
+            if ImGui.Button("Combat.InstallHook()") then
+                local ok, err = Combat.InstallHook()
+                meter.last_error = ok and nil or err
+            end
+        else
+            if ImGui.Button("Combat.UninstallHook()") then
+                Combat.UninstallHook()
+            end
+        end
+        if meter.last_error then
+            ImGui.Text("install failed: " .. meter.last_error)
+        end
+
+        ImGui.Text("Combat.GetEventCount(): " .. Combat.GetEventCount())
+        ImGui.Text("Combat.GetDroppedCount(): " .. Combat.GetDroppedCount())
+
+        ImGui.Text(string.format("Damage dealt: %d (%d hits)", meter.damage_dealt, meter.hits_dealt))
+        ImGui.Text(string.format("Damage taken: %d (%d hits)", meter.damage_taken, meter.hits_taken))
+        ImGui.Text(string.format("Healing received: %d", meter.healing_received))
+
+        if ImGui.Button("Reset meter") then
+            meter.damage_dealt, meter.damage_taken, meter.healing_received = 0, 0, 0
+            meter.hits_dealt, meter.hits_taken = 0, 0
+            meter.log = {}
+        end
+
+        if ImGui.TreeNode("Recent events (Combat.PollEvents())") then
+            if #meter.log == 0 then
+                ImGui.Text("(no combat events captured yet)")
+            end
+            for _, line in ipairs(meter.log) do
+                ImGui.Text(line)
+            end
+            ImGui.TreePop()
+        end
+    end
+end
+
 -- Begin a new ImGui window
 if ImGui.Begin("Frontiers Forge Test Window") then
 
@@ -514,6 +615,8 @@ if ImGui.Begin("Frontiers Forge Test Window") then
     DisplayAbilityBarFunctions()
 
     DisplayGroupFunctions()
+
+    DisplayCombatFunctions()
 end
 -- End the window
 ImGui.End()
