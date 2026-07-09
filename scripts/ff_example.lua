@@ -11,6 +11,7 @@ local AbilityBar = require("frontiers_forge.ability_bar")   -- Access ability ba
 local Group = require("frontiers_forge.group")              -- Access group info
 local Combat = require("frontiers_forge.combat")             -- Combat event hook (damage/heal capture)
 local QuestLog = require("frontiers_forge.quest_log")        -- Access the quest log
+local Icon = require("frontiers_forge.icon")                 -- Decode game icons into ImGui textures
 
 local function NotInGameWarning()
     ImGui.Text("(not in game - load a character to see this section)")
@@ -343,8 +344,57 @@ local function DisplayAbilityDetails(ability)
     ImGui.Text(string.format("GetRange: %.2f", ability:GetRange()))
     ImGui.Text("GetCastTime: " .. ability:GetCastTime())
     ImGui.Text("GetPwrCost: " .. ability:GetPwrCost())
-    ImGui.Text("GetIconBackgroundRef: " .. ability:GetIconBackgroundRef())
-    ImGui.Text("GetIconForegroundRef: " .. ability:GetIconForegroundRef())
+    -- Icon refs are resource hashes. The hex form matches the res_<hash>.png
+    -- file names produced by tools/rip_esf_icons.py.
+    ImGui.Text(string.format("GetIconBackgroundRef: %08X", ability:GetIconBackgroundRef()))
+    ImGui.Text(string.format("GetIconForegroundRef: %08X", ability:GetIconForegroundRef()))
+
+    -- Icon.GetTexture(hash): decodes the icon straight out of game memory the
+    -- first time and returns a cached ImGui texture afterwards. Draw the
+    -- background first, then the foreground on top of it at the same spot.
+    local bg_texture, bg_w, bg_h = Icon.GetTexture(ability:GetIconBackgroundRef())
+    local fg_texture, fg_w, fg_h = Icon.GetTexture(ability:GetIconForegroundRef())
+    local icon_scale = 1.5
+    if bg_texture or fg_texture then
+        ImGui.Text(string.format("Icon (untrimmed, bg:%dx%d, fg:%dx%d):", bg_w, bg_h, fg_w, fg_h))
+        ImGui.SameLine()
+        local cursor_x, cursor_y = ImGui.GetCursorPos()
+        if bg_texture then
+            ImGui.Image(bg_texture, bg_w * icon_scale, bg_h * icon_scale)
+        end
+        if fg_texture then
+            local offset_x = (bg_w - fg_w) * icon_scale / 2
+            local offset_y = (bg_h - fg_h) * icon_scale / 2
+            ImGui.SetCursorPos(cursor_x + offset_x, cursor_y + offset_y)
+            ImGui.Image(fg_texture, fg_w * icon_scale, fg_h * icon_scale)
+        end
+    else
+        ImGui.Text("Icon: (not found in the texture dictionary)")
+    end
+
+    -- Some icon surfaces carry large fully transparent margins, and some also
+    -- pad the art with a flat filler color. trim_transparent crops away the
+    -- transparent padding and trim_color additionally crops away the flat
+    -- colored padding, detected from the image's outer border ring.
+    local trimmed_bg_texture, trimmed_bg_w, trimmed_bg_h = Icon.GetTexture(ability:GetIconBackgroundRef(), {trim_transparent=true, trim_color=true})
+    local trimmed_fg_texture, trimmed_fg_w, trimmed_fg_h = Icon.GetTexture(ability:GetIconForegroundRef(), {trim_transparent=true, trim_color=true})
+    local icon_scale = 1.5
+    if trimmed_bg_texture or trimmed_fg_texture then
+        ImGui.Text(string.format("Icon (trimmed, bg:%dx%d, fg:%dx%d):", trimmed_bg_w, trimmed_bg_h, trimmed_fg_w, trimmed_fg_h))
+        ImGui.SameLine()
+        local cursor_x, cursor_y = ImGui.GetCursorPos()
+        if trimmed_bg_texture then
+            ImGui.Image(trimmed_bg_texture, trimmed_bg_w * icon_scale, trimmed_bg_h * icon_scale)
+        end
+        if trimmed_fg_texture then
+            local offset_x = (trimmed_bg_w - trimmed_fg_w) * icon_scale / 2
+            local offset_y = (trimmed_bg_h - trimmed_fg_h) * icon_scale / 2
+            ImGui.SetCursorPos(cursor_x + offset_x, cursor_y + offset_y)
+            ImGui.Image(trimmed_fg_texture, trimmed_fg_w * icon_scale, trimmed_fg_h * icon_scale)
+        end
+    else
+        ImGui.Text("Icon: (not found in the texture dictionary)")
+    end
     ImGui.Text("GetScope: " .. ability:GetScope() .. " (" .. GetScopeName(ability:GetScope()) .. ")")
     ImGui.Text("GetCooldown: " .. ability:GetCooldown())
     ImGui.Text(string.format("GetEquipRequirements: 0x%02X (bitmask)", ability:GetEquipRequirements()))
@@ -619,6 +669,48 @@ ff_combat_meter = ff_combat_meter or {
     log = {},
 }
 
+-- Save and load demo using UiForge profiles. The Save callback returns a
+-- plain data table which UiForge captures into the profile when you use
+-- File then Save Profile in the UiForge Settings window. The profile is
+-- written to scripts\profiles\<name>.profile.lua along with the set of
+-- enabled scripts and the window layout. When you apply a profile through
+-- File then Select Profile, the Load callback receives this script's saved
+-- table back after the script has run once.
+ff_save_demo = ff_save_demo or {
+    note = "",
+    counter = 0,
+    registered = false,
+    last_event = "(nothing saved or loaded yet)"
+}
+
+if not ff_save_demo.registered then
+    UiForge.RegisterCallback(UiForge.CallbackType.Save, function()
+        ff_save_demo.last_event = "saved"
+        return { note = ff_save_demo.note, counter = ff_save_demo.counter }
+    end)
+    UiForge.RegisterCallback(UiForge.CallbackType.Load, function(state)
+        ff_save_demo.note = tostring(state.note or "")
+        ff_save_demo.counter = tonumber(state.counter) or 0
+        ff_save_demo.last_event = "loaded"
+    end)
+    ff_save_demo.registered = true
+end
+
+local function DisplaySaveLoadFunctions()
+    if ImGui.CollapsingHeader("Save and Load Callbacks (Profiles)") then
+        ImGui.Text("Use File > Save Profile / Select Profile in the UiForge Settings window.")
+        ImGui.Text("Profiles are stored in: " .. UiForge.profiles_path)
+        ImGui.Text("This script's state is saved inside the profile under its file name.")
+        ff_save_demo.note = ImGui.InputText("note to persist", ff_save_demo.note)
+        if ImGui.Button("Increment counter") then
+            ff_save_demo.counter = ff_save_demo.counter + 1
+        end
+        ImGui.SameLine()
+        ImGui.Text("counter: " .. ff_save_demo.counter)
+        ImGui.Text("Last event: " .. ff_save_demo.last_event)
+    end
+end
+
 local function DisplayCombatFunctions()
     -- Poll every frame while the hook is up, even when the header is
     -- collapsed, so the 64-entry ring buffer never overruns.
@@ -723,6 +815,8 @@ if ImGui.Begin("Frontiers Forge Test Window") then
     DisplayGroupFunctions()
 
     DisplayCombatFunctions()
+
+    DisplaySaveLoadFunctions()
 end
 -- End the window
 ImGui.End()

@@ -14,3 +14,6 @@ releases/
 forge_log*
 inject_log*
 
+# Ignore extra files produced by FF
+# .entl files are the entity list files produced by entity tracking
+*.entl

@@ -13,9 +13,33 @@ rem   BuildFrontiersForge.bat -zip -version 1.2.3
 rem   BuildFrontiersForge.bat -package -version 1.2.3
 rem   BuildFrontiersForge.bat -package 1.2.3
 rem
+rem Flags (each also accepts / and -- prefixes, e.g. /zip, --zip):
+rem   -h, --help, /?     Show usage and exit.
+rem
+rem   -zip               Bundle a release zip after building and syncing.
+rem                      Requires -version. Output: releases\FrontiersForge-v<ver>.zip
+rem
+rem   -package           Shorthand for "-zip -nobuild": bundle a release zip from
+rem                      the already-built files, skipping the UiForge build step.
+rem                      UiForge must have been built previously. Requires -version.
+rem
+rem   -nobuild,          Skip building UiForge. The scripts sync (and zip, if
+rem   -skipbuild         requested) still run against whatever is already on disk.
+rem
+rem   -nosync,           Skip copying UiForge\scripts -> scripts\. Useful when the
+rem   -skipsync          local scripts directory has changes you don't want touched.
+rem
+rem   -version x.x.x,    Version string used in the zip file name. Only meaningful
+rem   -v x.x.x           together with -zip or -package.
+rem
+rem   <x.x.x>            A bare version number as the only argument implies -zip,
+rem                      so "BuildFrontiersForge.bat 1.2.3" builds, syncs, and zips.
+rem
 rem Notes:
 rem   - Requires the UiForge toolchain as configured by UiForge/build_uiforge.bat
 rem   - Robocopy exit codes 0-7 are success; >=8 is failure
+rem   - The sync and zip steps exclude runtime state (scripts\profiles) so personal
+rem     profiles are neither overwritten locally nor shipped in releases
 rem =====================================================================================
 
 set "ROOT=%~dp0"
@@ -116,7 +140,9 @@ if "%SKIP_SYNC%"=="1" (
     exit /b 1
   )
   if not exist "%ROOT%scripts\" mkdir "%ROOT%scripts" >nul 2>&1
-  robocopy "%UIFORGE_DIR%\scripts" "%ROOT%scripts" /E /R:2 /W:1 /NP /NFL /NDL /NJH /NJS
+
+  rem /XD keeps UiForge's local runtime profiles from clobbering mine on accident.
+  robocopy "%UIFORGE_DIR%\scripts" "%ROOT%scripts" /E /R:2 /W:1 /NP /NFL /NDL /NJH /NJS /XD "%UIFORGE_DIR%\scripts\profiles"
   set "ROBO_RC=!ERRORLEVEL!"
   if !ROBO_RC! GEQ 8 (
     echo ERROR: Robocopy failed with exit code !ROBO_RC!
@@ -160,7 +186,8 @@ if not exist "%ROOT%scripts\" (
   exit /b 1
 )
 
-robocopy "%ROOT%scripts" "%STAGING_DIR%\scripts" /E /R:2 /W:1 /NP /NFL /NDL /NJH /NJS
+rem Personal saves must not ship in release zips. Sorry guys :)
+robocopy "%ROOT%scripts" "%STAGING_DIR%\scripts" /E /R:2 /W:1 /NP /NFL /NDL /NJH /NJS /XD "%ROOT%scripts\profiles"
 if %ERRORLEVEL% GEQ 8 (
   echo ERROR: Failed copying scripts into staging directory
   exit /b 1
@@ -203,6 +230,14 @@ echo   BuildFrontiersForge.bat -package -version 1.2.3
 echo   BuildFrontiersForge.bat -nobuild -zip -version 1.2.3
 echo   BuildFrontiersForge.bat -nosync -package -version 1.2.3
 echo   BuildFrontiersForge.bat 1.2.3
+echo.
+echo Flags:
+echo   -zip               Bundle a release zip (requires -version)
+echo   -package           Zip pre-built files, skipping the UiForge build (requires -version)
+echo   -nobuild           Skip building UiForge
+echo   -nosync            Skip copying UiForge\scripts to scripts\
+echo   -version x.x.x     Version string for the zip file name
+echo   x.x.x              Bare version as only argument implies -zip
 exit /b 0
 
 :usage_fail

@@ -93,9 +93,66 @@ local function OnDisable()
     UI.EnableHealthBar()
 end
 
+-- Returns a plain data table of every user customizable option. UiForge captures
+-- this into the profile on File > Save Profile and hands it back to Load when a
+-- profile is applied. Textures are intentionally not saved.
+local function Save()
+    local state = retro_health_hearts_state
+    return {
+        heart_accent_tint           = state.heart_accent_tint,
+        heart_border_tint           = state.heart_border_tint,
+        heart_fill_tint             = state.heart_fill_tint,
+        heart_highlight_tint        = state.heart_highlight_tint,
+
+        show_accent                 = state.show_accent,
+        show_border                 = state.show_border,
+
+        heart_count                 = state.heart_count,
+        heart_scale                 = state.heart_scale,
+        heart_spacing               = state.heart_spacing,
+
+        disable_default_health_bar  = state.disable_default_health_bar,
+    }
+end
+
+-- Copies a saved value into state only when its type matches the current value,
+-- so a hand edited or stale profile cannot corrupt the state table.
+local function ApplySavedValue(saved, key)
+    local state = retro_health_hearts_state
+    if saved[key] ~= nil and type(saved[key]) == type(state[key]) then
+        state[key] = saved[key]
+    end
+end
+
+local function Load(saved)
+    if type(saved) ~= "table" then return end
+
+    local simple_keys = {
+        "heart_accent_tint", "heart_border_tint", "heart_fill_tint", "heart_highlight_tint",
+        "show_accent", "show_border",
+        "heart_count", "heart_scale", "heart_spacing",
+    }
+    for _, key in ipairs(simple_keys) do
+        ApplySavedValue(saved, key)
+    end
+
+    -- Reapply the health bar patch unconditionally. Disabling the script (or
+    -- applying another profile) restores the game health bar via OnDisable
+    -- WITHOUT changing this setting, so the in-game UI can be out of sync with
+    -- the saved value even when the two compare equal. Always re-assert it.
+    if type(saved.disable_default_health_bar) == "boolean" then
+        retro_health_hearts_state.disable_default_health_bar = saved.disable_default_health_bar
+    end
+    ToggleDefaultHealthBar()
+end
+
 local function RegisterCallbacks()
     UiForge.RegisterCallback(UiForge.CallbackType.Settings, Settings)
     UiForge.RegisterCallback(UiForge.CallbackType.DisableScript, OnDisable)
+    UiForge.RegisterCallback(UiForge.CallbackType.Save, Save)
+    UiForge.RegisterCallback(UiForge.CallbackType.Load, Load)
+    -- Make sure the game health bar comes back when UiForge unloads
+    UiForge.RegisterCallback(UiForge.CallbackType.OnEject, OnDisable)
     retro_health_hearts_state.callbacks_registered = true
 end
 

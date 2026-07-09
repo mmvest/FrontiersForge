@@ -89,8 +89,55 @@ local function Settings()
     end
 end
 
+-- Save callback. Returns a plain-data table describing the current simulation.
+-- The core captures it into the profile being saved (File > Save Profile).
+-- We snapshot every ball's position, velocity, radius and color so the exact
+-- frozen frame can be restored later.
+local function Save()
+    local saved_balls = {}
+    for i, ball in ipairs(test_02_state.balls) do
+        saved_balls[i] = {
+            position = { x = ball.position.x, y = ball.position.y },
+            velocity = { x = ball.velocity.x, y = ball.velocity.y },
+            radius   = ball.radius,
+            color    = ball.color,
+        }
+    end
+
+    return {
+        ball_count = test_02_state.ball_count,
+        balls      = saved_balls,
+    }
+end
+
+-- Load callback. Receives the table produced by Save when a profile is applied
+-- and rebuilds the simulation from it, so the balls jump back to their saved spots.
+local function Load(saved_state)
+    if type(saved_state) ~= "table" then
+        return
+    end
+
+    if saved_state.ball_count then
+        test_02_state.ball_count = saved_state.ball_count
+    end
+
+    if type(saved_state.balls) == "table" then
+        test_02_state.balls = {}
+        for i, saved_ball in ipairs(saved_state.balls) do
+            test_02_state.balls[i] = Ball:new(
+                { x = saved_ball.position.x, y = saved_ball.position.y },
+                { x = saved_ball.velocity.x, y = saved_ball.velocity.y },
+                saved_ball.radius,
+                saved_ball.color
+            )
+        end
+    end
+end
+
 if test_02_state.settings_registered == false then
     UiForge.RegisterCallback(UiForge.CallbackType.Settings, Settings)
+    UiForge.RegisterCallback(UiForge.CallbackType.Save, Save)
+    UiForge.RegisterCallback(UiForge.CallbackType.Load, Load)
     test_02_state.settings_registered = true
 end
 

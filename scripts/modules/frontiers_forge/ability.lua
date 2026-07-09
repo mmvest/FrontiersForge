@@ -25,8 +25,8 @@ ffi.cdef[[
         float    range;                 // +0x30
         uint32_t cast_time;             // +0x34
         uint32_t pwr_cost;              // +0x38
-        uint32_t icon_bkgrnd_ref;       // +0x3C
-        uint32_t icon_foregrnd_ref;     // +0x40
+        uint32_t icon_bkgrnd_ref;       // +0x3C  resource hash into the UI texture dictionary
+        uint32_t icon_foregrnd_ref;     // +0x40  resource hash into the UI texture dictionary
         uint32_t scope;                 // +0x44
         uint32_t cooldown;              // +0x48
         uint32_t equip_req;             // +0x4C  bitmask
@@ -105,12 +105,14 @@ function Ability:GetPwrCost()
     return self.ptr.pwr_cost
 end
 
---- @return integer icon_ref Icon reference for the icon background.
+--- The icon refs are 32 bit resource hashes the game looks up in its texture
+--- dictionary when drawing the spellbook and hotbar.
+--- @return integer icon_ref Resource hash for the icon background texture.
 function Ability:GetIconBackgroundRef()
     return self.ptr.icon_bkgrnd_ref
 end
 
---- @return integer icon_ref Icon reference for the icon foreground.
+--- @return integer icon_ref Resource hash for the icon foreground texture.
 function Ability:GetIconForegroundRef()
     return self.ptr.icon_foregrnd_ref
 end

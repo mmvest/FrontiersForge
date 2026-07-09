@@ -671,8 +671,99 @@ local function Settings()
     -- mini_map_state.map_texture_offset_y    = ImGui.SliderInt("Y offset", mini_map_state.map_texture_offset_y, 0, 300, tostring(mini_map_state.map_texture_offset_y))
 end
 
+-- Returns a plain data table of every user customizable option. UiForge captures
+-- this into the profile on File > Save Profile and hands it back to Load when a
+-- profile is applied. Textures and runtime caches are intentionally not saved.
+-- The tracked entity entries themselves live in .entl files, so only the active
+-- list file name and the tracking toggles are saved here.
+local function Save()
+    local state = mini_map_state
+    return {
+        disable_compass                 = state.disable_compass,
+        disable_in_start_menu           = state.disable_in_start_menu,
+
+        map_scale                       = state.map_scale,
+        map_zoom                        = state.map_zoom,
+        map_texture_tint                = state.map_texture_tint,
+        show_map_border                 = state.show_map_border,
+        map_border_color                = state.map_border_color,
+        map_border_thickness            = state.map_border_thickness,
+
+        player_indicator_scale          = state.player_indicator_scale,
+        show_player_indicator_border    = state.show_player_indicator_border,
+        player_indicator_border_color   = state.player_indicator_border_color,
+        show_player_indicator_fill      = state.show_player_indicator_fill,
+        player_indicator_fill_color     = state.player_indicator_fill_color,
+
+        show_entities                   = state.show_entities,
+        entity_radius                   = state.entity_radius,
+        show_entity_border              = state.show_entity_border,
+        entity_border_thickness         = state.entity_border_thickness,
+        entity_border_color             = state.entity_border_color,
+
+        entity_tracking_enabled         = state.entity_tracking_enabled,
+        ping_tracked_entities           = state.ping_tracked_entities,
+        line_to_tracked_entities        = state.line_to_tracked_entities,
+        tracked_entities_file_name      = state.tracked_entities_file_name,
+    }
+end
+
+-- Copies a saved value into state only when its type matches the current value,
+-- so a hand edited or stale profile cannot corrupt the state table.
+local function ApplySavedValue(saved, key)
+    local state = mini_map_state
+    if saved[key] ~= nil and type(saved[key]) == type(state[key]) then
+        state[key] = saved[key]
+    end
+end
+
+local function Load(saved)
+    if type(saved) ~= "table" then return end
+
+    local simple_keys = {
+        "disable_in_start_menu",
+        "map_scale", "map_zoom", "map_texture_tint",
+        "show_map_border", "map_border_color", "map_border_thickness",
+        "player_indicator_scale",
+        "show_player_indicator_border", "player_indicator_border_color",
+        "show_player_indicator_fill", "player_indicator_fill_color",
+        "show_entities", "entity_radius",
+        "show_entity_border", "entity_border_thickness", "entity_border_color",
+        "entity_tracking_enabled", "ping_tracked_entities", "line_to_tracked_entities",
+    }
+    for _, key in ipairs(simple_keys) do
+        ApplySavedValue(saved, key)
+    end
+
+    -- Reapply the compass patch unconditionally. Disabling the script (or
+    -- applying another profile) restores the game compass via RestoreGameUi
+    -- WITHOUT changing this setting, so the in-game UI can be out of sync with
+    -- the saved value even when the two compare equal. Always re-assert it.
+    if type(saved.disable_compass) == "boolean" then
+        mini_map_state.disable_compass = saved.disable_compass
+    end
+    ToggleCompass()
+
+    -- Restore the active tracked entities list and load it from disk
+    if type(saved.tracked_entities_file_name) == "string" and saved.tracked_entities_file_name ~= "" then
+        mini_map_state.tracked_entities_file_name = SanitizeFileName(saved.tracked_entities_file_name)
+        mini_map_state.tracked_entities_file_name_buffer = mini_map_state.tracked_entities_file_name
+        LoadTrackedEntitiesFromFile()
+        mini_map_state.tracked_entities_loaded = true
+    end
+end
+
+-- Leave the game the way we found it when the script is disabled or UiForge ejects
+local function RestoreGameUi()
+    UI.EnableCompass()
+end
+
 local function RegisterSettings()
     UiForge.RegisterCallback(UiForge.CallbackType.Settings, Settings)
+    UiForge.RegisterCallback(UiForge.CallbackType.Save, Save)
+    UiForge.RegisterCallback(UiForge.CallbackType.Load, Load)
+    UiForge.RegisterCallback(UiForge.CallbackType.DisableScript, RestoreGameUi)
+    UiForge.RegisterCallback(UiForge.CallbackType.OnEject, RestoreGameUi)
     mini_map_state.settings_registered = true
 end
 

@@ -1,5 +1,12 @@
 local  bit = require("bit")
 
+-- click_tally lives in this package's own modules folder
+-- (scripts\test_window_01\modules\click_tally.lua). No entry in the shared
+-- scripts\modules directory is needed. Because modules are cached by
+-- require, the tally persists across frames even though this script file
+-- re-runs every frame.
+local ClickTally = require("click_tally")
+
 state = state or {
     button_clicked      = false,
     checkbox_checked    = false,
@@ -246,11 +253,44 @@ if ImGui.Begin("Hello, UiForge!", true, ImGuiWindowFlags.MenuBar) then
         ImGui.TreePop()
     end
 
+    if ImGui.TreeNode("Local Module Demo (click_tally)") then
+        ImGui.Text("This section uses a module bundled inside this script's package,")
+        ImGui.Text("loaded with require(\"click_tally\").")
+
+        if ImGui.Button("Tally Button A") then
+            ClickTally.Record("Tally Button A")
+        end
+        ImGui.SameLine()
+        if ImGui.Button("Tally Button B") then
+            ClickTally.Record("Tally Button B")
+        end
+        ImGui.SameLine()
+        if ImGui.Button("Reset Tally") then
+            ClickTally.Reset()
+        end
+
+        ImGui.Text("ClickTally.GetTotal(): " .. ClickTally.GetTotal())
+        ImGui.Text("ClickTally.GetSummary(): " .. ClickTally.GetSummary())
+        ImGui.TreePop()
+    end
+
     if ImGui.TreeNode("Images") then
         if state.image_texture == nil then
-            state.image_texture = UiForge.IGraphicsApi.CreateTextureFromFile(UiForge.resources_path .. "\\gear-icon.png")
+            -- PER PACKAGE RESOURCE
+            -- Relative paths resolve against this package's own resources folder
+            -- first (scripts\test_window_01\resources), then fall back to the
+            -- shared scripts\resources directory.
+            state.image_texture = UiForge.LoadTexture("gear-icon.png")
         end
-        
+
+        if state.global_image_texture == nil then
+            -- GLOBAL RESOURCE
+            -- To load from the shared scripts\resources directory explicitly,
+            -- build an absolute path with UiForge.resources_path. Absolute paths
+            -- skip the per package lookup entirely.
+            state.global_image_texture = UiForge.LoadTexture(UiForge.resources_path .. "\\gear-icon.png")
+        end
+
         if state.image_texture ~= nil then
             state.image_width = ImGui.SliderInt("Image Width", state.image_width, 32, 128)
             state.image_height = ImGui.SliderInt("Image Height", state.image_height, 32, 128)
@@ -260,7 +300,7 @@ if ImGui.Begin("Hello, UiForge!", true, ImGuiWindowFlags.MenuBar) then
             -- local image_tint = ImGui.GetColorU32(state.image_tint[1], state.image_tint[2], state.image_tint[3] , state.image_tint[4])
             -- local image_border_col = ImGui.GetColorU32(state.image_border_col[1], state.image_border_col[2], state.image_border_col[3] , state.image_border_col[4])
             
-            -- Simplified image call
+            -- Simplified image call, drawing the PER PACKAGE copy of the icon
             ImGui.Image(state.image_texture, state.image_width, state.image_height)
             ImGui.SameLine()
             
@@ -275,13 +315,20 @@ if ImGui.Begin("Hello, UiForge!", true, ImGuiWindowFlags.MenuBar) then
             ImGui.Dummy(state.image_width, state.image_height)
             ImGui.SameLine()
 
-            ImGui.Image(state.image_texture,
-                        ImVec2.new(state.image_width, state.image_height),
-                        ImVec2.new(0,0),
-                        ImVec2.new(1,1),
-                        ImVec4.new(state.image_tint[1], state.image_tint[2], state.image_tint[3] , state.image_tint[4]),
-                        ImVec4.new(state.image_border_col[1], state.image_border_col[2], state.image_border_col[3] , state.image_border_col[4])
-                        )
+            -- Advanced image call, drawing the GLOBAL copy of the icon loaded
+            -- from the shared resources directory
+            if state.global_image_texture ~= nil then
+                ImGui.Image(state.global_image_texture,
+                            ImVec2.new(state.image_width, state.image_height),
+                            ImVec2.new(0,0),
+                            ImVec2.new(1,1),
+                            ImVec4.new(state.image_tint[1], state.image_tint[2], state.image_tint[3] , state.image_tint[4]),
+                            ImVec4.new(state.image_border_col[1], state.image_border_col[2], state.image_border_col[3] , state.image_border_col[4])
+                            )
+            end
+
+            ImGui.Text("Left icon: package resource via UiForge.LoadTexture(\"gear-icon.png\")")
+            ImGui.Text("Right icon: global resource via UiForge.LoadTexture(UiForge.resources_path .. \"\\\\gear-icon.png\")")
         end
         ImGui.TreePop()
     end
