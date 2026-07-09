@@ -15,7 +15,11 @@ ffi.cdef[[
         uint32_t valid;                 // +0x1C  nonzero when this record holds a real ability?
         uint32_t spellbook_slot;        // +0x20  spellbook position; 0-4 also appear on the hotbar,
                                         //        0xFC-0xFF are the specific items placed in hotbar slots 5-8
-        int32_t  flag_24;               // +0x24  >0 draws an overlay icon (0x3d) on the hotbar slot?
+        int32_t  cooldown_lockout_ms;   // +0x24  total lockout duration in ms while the ability is on
+                                        //        cooldown, 0 when ready. Equals (cast_time + cooldown)
+                                        //        * 1000 + 300. Server sent, constant while set (NOT a
+                                        //        countdown). Drives the dim overlay icon on the
+                                        //        hotbar slot.
         uint32_t unknown_28;            // +0x28
         uint32_t level;                 // +0x2C
         float    range;                 // +0x30
@@ -91,7 +95,7 @@ function Ability:GetRange()
     return self.ptr.range
 end
 
---- @return integer cast_time Cast time value as stored by the game.
+--- @return integer cast_time Cast time in seconds.
 function Ability:GetCastTime()
     return self.ptr.cast_time
 end
@@ -116,7 +120,7 @@ function Ability:GetScope()
     return self.ptr.scope
 end
 
---- @return integer cooldown Recast time value as stored by the game.
+--- @return integer cooldown Recast time in seconds.
 function Ability:GetCooldown()
     return self.ptr.cooldown
 end
@@ -124,6 +128,25 @@ end
 --- @return integer equip_req Equipment requirement bitmask.
 function Ability:GetEquipRequirements()
     return self.ptr.equip_req
+end
+
+--- Whether the ability is currently on cooldown (its hotbar icon is dimmed).
+--- Cooldowns are server authoritative. The flag is set the moment the cast
+--- starts and cleared when the server sends the ability ready message, the
+--- client never tracks the remaining time itself.
+--- @return boolean on_cooldown True while the ability is on cooldown.
+function Ability:IsOnCooldown()
+    return self.ptr.cooldown_lockout_ms > 0
+end
+
+--- Total lockout duration of the current cooldown in milliseconds, equal to
+--- (cast time + recast time) * 1000 + 300. The value is constant while the
+--- ability is on cooldown (it is NOT a live countdown). Modders wanting
+--- remaining time should record when IsOnCooldown flips true and count down
+--- from this value.
+--- @return integer lockout_ms Total lockout in ms, or 0 when the ability is ready.
+function Ability:GetCooldownLockoutMs()
+    return self.ptr.cooldown_lockout_ms
 end
 
 --- @return string name The ability name converted to UTF-8.

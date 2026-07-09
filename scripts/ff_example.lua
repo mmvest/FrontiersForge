@@ -347,6 +347,8 @@ local function DisplayAbilityDetails(ability)
     ImGui.Text("GetScope: " .. ability:GetScope() .. " (" .. GetScopeName(ability:GetScope()) .. ")")
     ImGui.Text("GetCooldown: " .. ability:GetCooldown())
     ImGui.Text(string.format("GetEquipRequirements: 0x%02X (bitmask)", ability:GetEquipRequirements()))
+    ImGui.Text("IsOnCooldown: " .. tostring(ability:IsOnCooldown()))
+    ImGui.Text("GetCooldownLockoutMs: " .. ability:GetCooldownLockoutMs())
 end
 
 demo_ability_state = demo_ability_state or {
@@ -399,6 +401,86 @@ local function DisplayAbilityListFunctions()
 end
 
 local function DisplayToolbeltFunctions()
+end
+
+-- Live cooldown state for every ability on the hotbars. I wanted to demo how
+-- you could use the cooldown functionality the API exposes. IsOnCooldown() tracks
+-- the icon dimming on the hot bar and that starts the moment you press the button
+-- to cast the spell/ability. GetCooldownLockoutMs() is the total lockout in ms
+-- which is ((cast + recast) * 1000 + 300).The Client never counts it down, the
+-- server will tell the client when the spell is ready to be used again.
+--
+-- Because the client stores no live countdown, remaining time is ESTIMATED
+-- here. This section runs every frame, but the server's ready message may
+-- arrive slightly before or after our estimate.
+cooldown_watch_state = cooldown_watch_state or {}
+local function UpdateCooldownTracking()
+    if Util.IsInGame() == 0 then
+        return
+    end
+
+    local now = os.clock()
+    for bar_index = 0, AbilityBar.num_bars - 1 do
+        for slot_index = 0, AbilityBar.GetSlotCount(bar_index) - 1 do
+            local ability = AbilityBar.GetAbility(bar_index, slot_index)
+            if ability ~= nil then
+                local id = ability:GetId()
+                if not ability:IsOnCooldown() then
+                    -- Ability is ready; forget any tracked cooldown.
+                    cooldown_watch_state[id] = nil
+                elseif cooldown_watch_state[id] == nil then
+                    -- Rising edge: first frame we see this ability on cooldown.
+                    cooldown_watch_state[id] = now
+                end
+            end
+        end
+    end
+end
+
+local function DisplayCooldownWatch()
+    if ImGui.CollapsingHeader("Cooldown Watch") then
+        if Util.IsInGame() == 0 then
+            NotInGameWarning()
+            return
+        end
+
+        local now = os.clock()
+
+        for bar_index = 0, AbilityBar.num_bars - 1 do
+            for slot_index = 0, AbilityBar.GetSlotCount(bar_index) - 1 do
+                local ability = AbilityBar.GetAbility(bar_index, slot_index)
+                if ability ~= nil then
+                    local started = cooldown_watch_state[ability:GetId()]
+
+                    if not ability:IsOnCooldown() then
+                        ImGui.Text(string.format("bar %d slot %d  %-24s ready",
+                            bar_index, slot_index, ability:GetName()))
+                    elseif started == nil then
+                        -- On cooldown but we never saw the rising edge (cooldown
+                        -- began before this script loaded), so no estimate exists.
+                        ImGui.Text(string.format("bar %d slot %d  %-24s on cooldown (start not observed)",
+                            bar_index, slot_index, ability:GetName()))
+                    else
+                        local elapsed        = now - started
+                        local cast_left      = math.max(ability:GetCastTime() - elapsed, 0)
+                        local cooldown_left  = math.max((ability:GetCooldownLockoutMs() / 1000) - elapsed, 0)
+
+                        local status
+                        if cast_left > 0 then
+                            status = string.format("casting %.1fs   cooldown %.1fs", cast_left, cooldown_left)
+                        elseif cooldown_left > 0 then
+                            status = string.format("cooldown %.1fs", cooldown_left)
+                        else
+                            status = "waiting on server ready message"
+                        end
+
+                        ImGui.Text(string.format("bar %d slot %d  %-24s %s",
+                            bar_index, slot_index, ability:GetName(), status))
+                    end
+                end
+            end
+        end
+    end
 end
 
 local function DisplayAbilityBarFunctions()
@@ -587,6 +669,9 @@ local function DisplayCombatFunctions()
     end
 end
 
+-- Per-frame state updates that must run regardless of any UI visibility.
+UpdateCooldownTracking()
+
 -- Begin a new ImGui window
 if ImGui.Begin("Frontiers Forge Test Window") then
 
@@ -607,6 +692,8 @@ if ImGui.Begin("Frontiers Forge Test Window") then
     DisplayAbilityListFunctions()
 
     DisplayAbilityBarFunctions()
+
+    DisplayCooldownWatch()
 
     DisplayGroupFunctions()
 

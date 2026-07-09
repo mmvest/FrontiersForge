@@ -8,7 +8,8 @@ ffi.cdef[[
     typedef struct {
         int32_t  unknown_00;        // +0x00  always -1
         int32_t  ability_icon_ref;  // +0x04  icon foreground ref (copied from ability +0x40), -1 if empty
-        int32_t  overlay_icon_ref;  // +0x08  0x3d overlay when ability flag_24 > 0, else -1
+        int32_t  overlay_icon_ref;  // +0x08  0x3d dim overlay when the ability is on cooldown
+                                    //        (ability cooldown_lockout_ms > 0), else -1
         int32_t  unknown_0C;        // +0x0C  always -1
         int32_t  unknown_10;        // +0x10  always -1
         uint32_t unknown_14;        // +0x14  always 0
