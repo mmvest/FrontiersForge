@@ -10,6 +10,7 @@ local AbilityList = require("frontiers_forge.ability_list") -- Access abilities 
 local AbilityBar = require("frontiers_forge.ability_bar")   -- Access ability bar
 local Group = require("frontiers_forge.group")              -- Access group info
 local Combat = require("frontiers_forge.combat")             -- Combat event hook (damage/heal capture)
+local QuestLog = require("frontiers_forge.quest_log")        -- Access the quest log
 
 local function NotInGameWarning()
     ImGui.Text("(not in game - load a character to see this section)")
@@ -528,6 +529,28 @@ local function DisplayAbilityBarFunctions()
     end
 end
 
+local function DisplayQuestLogFunctions()
+    if ImGui.CollapsingHeader("QuestLog Functions") then
+        if Util.IsInGame() == 0 then
+            NotInGameWarning()
+            return
+        end
+
+        -- QuestLog.GetCount(): how many quests are in the log (max 8)
+        local count = QuestLog.GetCount()
+        ImGui.Text("QuestLog.GetCount(): " .. count .. " / " .. QuestLog.max_quests)
+
+        -- QuestLog.Quests(): iterate the log in display order. Indices are
+        -- zero based, matching the game's own quest log window.
+        for index, quest in QuestLog.Quests() do
+            ImGui.Text(index .. ". " .. quest:GetName())
+        end
+
+        -- QuestLog.GetQuestByIndex(index) also works for direct access,
+        -- returning nil when the index is out of range.
+    end
+end
+
 local function DisplayGroupMemberDetails(member)
     ImGui.Text("GetEntityId: " .. member:GetEntityId())
     ImGui.Text("GetName: " .. member:GetName())
@@ -694,6 +717,8 @@ if ImGui.Begin("Frontiers Forge Test Window") then
     DisplayAbilityBarFunctions()
 
     DisplayCooldownWatch()
+
+    DisplayQuestLogFunctions()
 
     DisplayGroupFunctions()
 
