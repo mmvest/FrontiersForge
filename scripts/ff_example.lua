@@ -21,6 +21,7 @@ local function DisplayUtilFunctions()
         ImGui.Text("GetExpRequiredForLevel:" .. tostring(Util.GetExpRequiredForLevel(Player.GetLevel())))
         ImGui.Text("IsInGame: " .. tostring(Util.IsInGame()))
         ImGui.Text("IsStartMenuOpen: " .. tostring(Util.IsStartMenuOpen()))
+        ImGui.Text("IsBattleMusicPlaying: " .. tostring(Util.IsBattleMusicPlaying()))
     end
 end
 
@@ -156,6 +157,19 @@ local function DisplayUiFunctions()
     end
 end
 
+local function DisplayEntityDetails(entity)
+    ImGui.Text("Name: " .. entity.name)
+    ImGui.Text("ID: " .. entity.id)
+    ImGui.Text("Level: " .. entity.level)
+    ImGui.Text("HP: " .. entity.percent_hp .. "%")
+    ImGui.Text(string.format("Coordinates: x = %.2f, y = %.2f, z = %.2f", entity.x, entity.y, entity.z))
+
+    -- Disposition towards the player. The server only sends this
+    -- for the CURRENT TARGET, so every other entity shows nil / "Unknown".
+    ImGui.Text("Disposition: " .. tostring(entity.disposition)
+        .. " (" .. tostring(entity.disposition_name) .. ")")
+end
+
 local function DisplayPlayerFunctions()
     if ImGui.CollapsingHeader("Player Functions") then
         ImGui.Text("GetName: " .. Player.GetName())
@@ -200,31 +214,11 @@ local function DisplayPlayerFunctions()
         ImGui.Text("GetTargetEntityId: " .. Player.GetTargetEntityId())
         local target = EntityList.GetEntityById(Player.GetTargetEntityId())
         if target ~= nil then
-            ImGui.Text("Current target:")
-            ImGui.Text("  Name: " .. target.name)
-            ImGui.Text("  ID: " .. target.id)
-            ImGui.Text("  Level: " .. target.level)
-            ImGui.Text("  HP: " .. target.percent_hp .. "%")
-            ImGui.Text(string.format("  Coordinates: x = %.2f, y = %.2f, z = %.2f", target.x, target.y, target.z))
-            ImGui.Text("  Disposition: " .. tostring(target.disposition)
-                .. " (" .. tostring(target.disposition_name) .. ")")
+            DisplayEntityDetails(target)
         else
             ImGui.Text("Current target: (nothing targeted)")
         end
     end
-end
-
-local function DisplayEntityDetails(entity)
-    ImGui.Text("Name: " .. entity.name)
-    ImGui.Text("ID: " .. entity.id)
-    ImGui.Text("Level: " .. entity.level)
-    ImGui.Text("HP: " .. entity.percent_hp .. "%")
-    ImGui.Text(string.format("Coordinates: x = %.2f, y = %.2f, z = %.2f", entity.x, entity.y, entity.z))
-
-    -- Disposition towards the player. The server only sends this
-    -- for the CURRENT TARGET, so every other entity shows nil / "Unknown".
-    ImGui.Text("Disposition: " .. tostring(entity.disposition)
-        .. " (" .. tostring(entity.disposition_name) .. ")")
 end
 
 local function DisplayEntityListFunctions()

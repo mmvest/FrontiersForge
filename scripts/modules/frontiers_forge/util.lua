@@ -249,6 +249,20 @@ function Util.IsStartMenuOpen()
     return Util.ReadFromPointerChain(0x14E200, {0x15C, 0x53C, 0x8, 0x88, 0x24}, "uint8_t", 0)
 end
 
+--- Whether the battle music is currently playing.
+--- Reads the flag byte at offset 0x263 of the player's entity record, which is
+--- the same byte the game reads when deciding whether to play battle music. The
+--- server sets it a few seconds after combat begins and clears it immediately when
+--- combat ends, so it lags behind real combat state a little. Any of you modders
+--- that want to determine whether a player is in or out of combat may find this
+--- useful but it shouldn't be used on its own for that purpose.
+--- @return boolean True when the battle music flag is set.
+function Util.IsBattleMusicPlaying()
+    local entity_list_offset = 0x1FB6C30
+    local player_entity = Util.ReadFromOffset(entity_list_offset, "uint32_t")
+    return Util.ReadFromOffset(player_entity + 0x263, "uint8_t") ~= 0
+end
+
 --- Retrieve the player's compass heading in radians.
 --- @return number radians Compass heading in radians.
 function Util.GetCompassRadians()
