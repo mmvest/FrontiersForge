@@ -1,16 +1,10 @@
 local Util = require("frontiers_forge.util")
 local Ability = require("frontiers_forge.ability")
 
--- The player's ability list is owned by the client-state singleton. Rather
--- than hardcoding the singleton's address, we resolve it the same way the
--- game does: the static pointer at 0x4E37F0 (VIWnd's GUI-context pointer) points at singleton + 4.
--- Relative to the singleton:
---   +0x2BB2C = entry count, INCLUDING the index-0 sentinel
---   +0x2BB34 = pointer to the record array (stride 0x1D8)
---   +0x2BB38 = index of the binary-search-tree root
---
--- Records double as tree nodes linked by index (see ability.lua). Index 0 is a
--- null sentinel, so real abilities occupy indices 1 .. count-1.
+-- The ability list is owned by the client-state singleton, resolved through the
+-- static pointer at 0x4E37F0 which points at singleton + 4 (so each chain step is
+-- offset - 4). The records double as binary-search-tree nodes linked by index,
+-- with index 0 a null sentinel, so real abilities occupy indices 1 .. count-1.
 local AbilityList = {}
 
 local GUI_CONTEXT_PTR_OFFSET = 0x4E37F0
@@ -40,11 +34,14 @@ function AbilityList.GetAbilityByIndex(index)
         return nil
     end
     local base = GetBaseOffset()
-    if base == nil then
+    if base == nil or not Util.IsValidEEPointer(base) then
         return nil
     end
-    local address = Util.EEmem() + base + (index * Ability.size)
-    return Ability.new(address)
+    local record_offset = base + (index * Ability.size)
+    if record_offset + Ability.size > Util.EE_RAM_SIZE then
+        return nil
+    end
+    return Ability.new(Util.EEmem() + record_offset)
 end
 
 -- Tree traversal. Both helpers treat an unresolvable node (list unloaded, or

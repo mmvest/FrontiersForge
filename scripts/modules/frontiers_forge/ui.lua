@@ -1,18 +1,11 @@
 local Util = require("frontiers_forge.util")
+local Icon = require("frontiers_forge.icon")
 
--- This offset is the base of the UI rendering code-block for the 9VIWndGame window.
--- This window handles compass, health, power, experience, and target nameplate.
--- Since the code is an overlay, it can be written anywhere in memory.
--- Due to this, we have to use a pointer chain to get the location.
---
--- For future reference, all seven element offsets we nop that are based in this window
--- are plain draw calls that sit strictly between this function's VIWindow_BeginDraw (+0x5C)
--- and VIWindow_EndDraw (+0x57C), so NOP'ing them individually is safe as the draw-context
--- save/restore stays balanced and no state leaks into other UI.
---
--- These are resolved lazily (per call) rather than once at load. The window
--- may not exist yet when the module is required, and the overlay
--- can relocate between calls. Each returns nil when the window isn't loaded.
+-- Base of the 9VIWndGame render code-block (compass, health, power, experience,
+-- target nameplate). Its draw calls all sit strictly between VIWindow_BeginDraw and
+-- VIWindow_EndDraw, so NOP'ing them individually is safe. The block is an overlay
+-- that can relocate, so it is resolved lazily through a pointer chain (nil until the
+-- window is loaded).
 local function wnd_game_offset()
     return Util.GetOffsetFromPointerChain(0x14E200, {0x190 , 0x53C, 0x20, 0x1C})
 end
@@ -26,21 +19,12 @@ end
 
 local NOP = 0x00000000
 
--- The chat window can't be disabled by NOP'ing its draw instruction like the other elements.
--- At chat_offset+0xE8 the game calls VIWindow_BeginDraw, which saves the global scratchpad
--- matrices and installs the chat window's own 2D overlay transform. The matching VIWindow_EndDraw
--- at +0x470 restores them.
---
--- Instead we replace the BeginDraw call with a PC-relative branch straight to the function's
--- epilogue at +0x4E4, skipping BeginDraw, every chat draw call, AND EndDraw together. Scratchpad
--- state is left completely untouched, so nothing leaks and other UI windows are unaffected.
---
--- This fixes a bug caused by NOP'ing the original instruction where the disabled chat box would
--- render under whatever transform is currently live. For example, when the player presses R1 to
--- select a target, the chat box appears next to the target indicator and rotates around the target.
---
--- Opcode: beq zero, zero, +0x3FC  ->  0x100000FE
---   offset = (0x4E4 - 0xE8 - 4) / 4 = 0xFE.
+-- The chat window can't be disabled by NOP'ing a single draw call, because its
+-- BeginDraw installs a 2D overlay transform that its EndDraw must restore. NOP'ing
+-- just the draw would leave the disabled box rendering under whatever transform is
+-- live (e.g. rotating around the target ring on R1). Instead we branch from the
+-- BeginDraw call straight to the epilogue, skipping BeginDraw, the draws, and EndDraw
+-- together, so scratchpad state is left untouched.
 local CHAT_WINDOW_DISABLE_BRANCH = 0x100000FE
 
 -- These element offsets are offsets away from base_offset
@@ -308,6 +292,46 @@ end
 --- Restores the chat window after DisableChatWindow.
 function UI.EnableChatWindow()
     EnableUIElement(ui_elements.chat_window)
+end
+
+-- ╔═══════════════════════════════════════════════════════════════════════════╗
+-- ║                            Disposition Faces                              ║
+-- ╚═══════════════════════════════════════════════════════════════════════════╝
+
+-- The game's target nameplate maps disposition to three face textures
+-- (built-in UI texture ids): 0-1 hostile, 4-6 friendly, everything else neutral.
+local DISPOSITION_FACE_HOSTILE  = 0x73
+local DISPOSITION_FACE_NEUTRAL  = 0x74
+local DISPOSITION_FACE_FRIENDLY = 0x75
+
+--- UI texture id of the face icon the game shows for a disposition value.
+--- @param disposition integer Disposition value (e.g. entity disposition).
+--- @return integer|nil tex_id UI texture id for Icon.GetUITexture, or nil for a nil disposition.
+function UI.GetDispositionFaceTexId(disposition)
+    disposition = tonumber(disposition)
+    if disposition == nil then
+        return nil
+    end
+    if disposition <= 1 then
+        return DISPOSITION_FACE_HOSTILE
+    elseif disposition >= 4 and disposition <= 6 then
+        return DISPOSITION_FACE_FRIENDLY
+    end
+    return DISPOSITION_FACE_NEUTRAL
+end
+
+--- Draws the disposition face for a disposition value at the current ImGui cursor.
+--- @param disposition integer Disposition value.
+--- @param scale number|nil Size multiplier, default 1.
+--- @return boolean drawn False when the texture is unavailable (nothing drawn).
+function UI.DrawDispositionIcon(disposition, scale)
+    local texture, w, h = Icon.GetUITexture(UI.GetDispositionFaceTexId(disposition))
+    if texture == nil then
+        return false
+    end
+    scale = scale or 1
+    ImGui.Image(texture, w * scale, h * scale)
+    return true
 end
 
 --- Disables every UI element this module knows about.

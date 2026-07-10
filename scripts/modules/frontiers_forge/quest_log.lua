@@ -1,16 +1,10 @@
 local Util = require("frontiers_forge.util")
 local Quest = require("frontiers_forge.quest")
 
--- The quest log is owned by the client-state singleton. the static pointer at
--- 0x4E37F0 points at singleton + 4. Relative to the singleton:
---   +0x2C6E0 = inline array of 8 quest records (stride 0x100, see quest.lua)
---   +0x2CEE0 = quest count
---
--- Unlike the ability list there is no sentinel and no tree. The array is
--- packed. The server appends titles one at a time (dispatcher case 0x62F914,
--- helper 0x6388B0) and removing a quest (0x62F950, helper 0x638918) shifts
--- the entries after it down, so valid quests always occupy indices
--- 0 .. count-1 in log order.
+-- The quest log is owned by the client-state singleton, resolved through the
+-- static pointer at 0x4E37F0 which points at singleton + 4. The quest array is
+-- packed with no sentinel, so valid quests always occupy indices 0 .. count-1 in
+-- log order.
 local QuestLog = {}
 
 local GUI_CONTEXT_PTR_OFFSET = 0x4E37F0

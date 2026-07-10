@@ -9,18 +9,18 @@
 
 ## Overview
 
-FrontiersForge is a Lua-based API designed to help developers create custom UI addons and access game data from EverQuest Online Adventures Frontiers as run on the [Sandstorm Server](https://eqoa.live/) using the [PCSX2 emulator](https://pcsx2.net/). This project piggybacks off the [UiForge](https://github.com/mmvest/User-Interface-Forge) project, providing an easy way to interact with the game's internal structures and display that data via custom UI elements powered by [ImGui](https://github.com/ocornut/imgui).
+FrontiersForge is a Lua-based API designed to help developers create custom UI addons and access game data from EverQuest Online Adventures Frontiers as run on the [Sandstorm Server](https://eqoa.live/) using the [PCSX2 emulator](https://pcsx2.net/). This project piggybacks off the [UiForge](https://github.com/mmvest/User-Interface-Forge) project, providing an easy way to interact with the game's internal structures and display that data via custom UI elements using [ImGui](https://github.com/ocornut/imgui).
 
-### Note: This is in a "pre-alpha" state. The implementation will likely change regularly. Expect large breaking changes to any mods created using these modules.
+### Note: This is in a "beta" state. You may anticipate the API to stay mostly consistent at this point, but until it is fully released, some aspects of the API may shift. Expect potentially breaking changes to any mods created using these modules.
 
 ### ⚠️ **WARNING**:
-Use this code at your own risk. UiForge injects code into the PCSX2 emulator and grants access to the game’s memory. Only place trusted scripts in the `scripts` and `scripts/modules` directory.
+Use this code at your own risk. UiForge injects code into the PCSX2 emulator and grants access to the game's memory. Only place trusted scripts in the `scripts` and `scripts/modules` directory.
 
 ## Requirements
 
-- **[PCSX2](https://pcsx2.net/)**: Tested on 64-bit versions of PCSX2 v2.0.2 and v2.2.0, running on Windows 11. Other versions may work, but they haven't been tested. This will almost certainly crash 32-bit version of PCSX2 (for now...).
-- **DirectX 11**: Currently UiForge only supports DirectX 11, so be sure PCSX2 is using that for rendering.
-- **Windows OS**: This definitely works on Windows 11 64-bit. I imagine it would also work on Windows 10 and maybe Windows 7. 
+- **[PCSX2](https://pcsx2.net/)**: Tested on 64-bit versions of PCSX2 v2.0.2 and v2.2.0, running on Windows 11. Other versions may work, but they haven't been tested.
+- **DirectX 11/12**: Currently UiForge only supports DirectX 11 and 12, so be sure PCSX2 is using one of those for rendering.
+- **Windows OS**: This definitely works on Windows 11 64-bit. I imagine it would also work on Windows 10 and maybe Windows 7.
 - **EQOA: Frontiers (US Version)**: This has only been tested on the US version of EverQuest Online Adventures: Frontiers.
 
 ## Setup and Running
@@ -50,11 +50,13 @@ To enable a script, click the checkbox next to it. Scripts that create Lua Error
 
 To see script settings or debug stats, click on the script name. If it has any settings, the settings will appear in the settings tab. Debug stats can be viewed by clicking the debug tab.
 
+For everything else about the host framework (script packages, callbacks, profiles, the config file, logging, and the `UiForge` Lua API for textures, fonts, and audio), see the [UiForge documentation](https://github.com/mmvest/User-Interface-Forge).
+
 ## Building (from source)
 
-`BuildFrontiersForge.bat` builds the UiForge submodule and then updates this repo’s `scripts/` by copying the latest scripts from `UiForge/scripts` into `scripts/` (overwriting old versions).
+`BuildFrontiersForge.bat` builds the UiForge submodule and then updates this repo's `scripts/` by copying the latest scripts from `UiForge/scripts` into `scripts/` (overwriting old versions).
 
-1. Ensure you can build UiForge (see the UiForge repo for the requirements).
+1. Ensure you can build UiForge (see the [UiForge repo](https://github.com/mmvest/User-Interface-Forge) for the requirements).
 1. Run:
    ```bat
    BuildFrontiersForge.bat
@@ -67,43 +69,43 @@ BuildFrontiersForge.bat -zip -version 1.2.3
 
 This writes `releases/FrontiersForge-v1.2.3.zip`.
 
-## Roadmap
+## Included scripts
 
-- **Current Work**: 
-  - Finish Modules:
-    - Ability bar module
-    - Toolbelt module
-    - Ability list module (accessing the abilities in your Abilities menu) 
-
-  
-- **Future Plans**:
-  - Inventory module for accessing inventory items
-  - Developing a community-driven wiki for sharing findings and collaborating on reverse-engineering the game’s data structures.
-  - Expand on the current modules
-    - e.g. Reversing camera functionality to enable customization of its anchor point and unlock vertical movement.
+| Script | Description |
+|--------|-------------|
+| [`ff_example.lua`](scripts/ff_example.lua) | A living demo of nearly every module and function FrontiersForge provides. Start here to see how the API is used. |
+| [`mini_map.lua`](scripts/mini_map.lua) | A configurable minimap showing nearby entities, with per-map settings, waypoints, and entity filtering. |
+| [`retro_health_hearts.lua`](scripts/retro_health_hearts.lua) | Displays player health as a row of retro-style hearts. |
 
 ## Modules
 
-### `frontiers_forge\camera.lua`
-Handles camera functionality, including retrieving the camera's current coordinates (`x`, `y`, `z`).
+The EQOA modules live in `scripts/modules/frontiers_forge` and are loaded with `require("frontiers_forge.<name>")`.
 
-### `frontiers_forge\entity.lua`
-Manages in-game entities and allows you to fetch data like health, coordinates, and names of entities within the game.
+| Module | Description |
+|--------|-------------|
+| `ability.lua` | Accessors for a single ability record. Name, description, range, cast time, power cost, cooldown state, icon refs, and scope. |
+| `ability_bar.lua` | The hotbar. Which ability or item occupies each hotbar slot. |
+| `ability_list.lua` | The full ability list from the Abilities menu. Iteration and lookup by id or name. |
+| `bank.lua` | Bank contents. |
+| `camera.lua` | Camera coordinates and facing (radians and degrees). |
+| `chat.lua` | Captures chat messages as they arrive, with message type classification. |
+| `combat.lua` | Combat event capture (damage and healing numbers). Useful for damage meters. |
+| `effects.lua` | The player's active effects (buffs and debuffs), icon hashes and names. |
+| `entity.lua` | Accessors for a single entity. Name, id, level, health percent, position, disposition, and distance to a world point. |
+| `entity_list.lua` | The 24-slot entity list. Lookup by index, id, or name. Slot 0 is always the player. |
+| `gems.lua` | Static gem data table (gem, rarity, type, stat). |
+| `group.lua` | Group membership and per-member data. |
+| `icon.lua` | Decodes game icon textures straight out of emulated PS2 memory into ImGui textures, cached by resource hash. |
+| `input.lua` | Controller input. Button states and raw or normalized analog stick values. |
+| `inventory.lua` | Inventory slots and their item records. |
+| `item.lua` | Accessors for a single item record. Name, stats, damage, range, icon refs, and more. |
+| `player.lua` | Player data. Name, level, experience, stats, resists, health, power, coordinates, and current target id. |
+| `quest.lua` | Accessors for a single quest log entry. |
+| `quest_log.lua` | The quest log list. Count and lookup by index. |
+| `ui.lua` | Toggles built-in HUD elements (ability bar, chat, health bar, etc.) and draws game UI art like disposition icons. |
+| `util.lua` | Low-level helpers. EE memory reads and writes, pointer chain resolution, guest pointer validation, string conversion, distance between world points, and experience tables. |
 
-### `frontiers_forge\input.lua`
-Provides access to controller input, including button states and analog stick movement.
-
-### `frontiers_forge\player.lua`
-Exposes player-specific data, such as name, level, stats (strength, dexterity, etc.), health, and power.
-
-### `frontiers_forge\ui.lua`
-Enables toggling of various UI elements such as the ability bar, chat window, health bar, etc.
-
-### `frontiers_forge\util.lua`
-Includes utility functions for interacting with the game’s memory, converting strings, and calculating experience requirements.
-
-### `imgui\imgui.lua`
-This is just a "meta" file to help enable intellisense and static analysis functionality for your code editor with regards to the imgui functions definitions that are made accessible through the `uiforge_core.dll`. DO NOT `Require` THIS IN YOUR SCRIPTS. That will break your Lua environment.
+Two additional module folders are type-hint stubs for your editor, `scripts/modules/imgui/imgui.lua` and `scripts/modules/uiforge/uiforge.lua`. They enable intellisense for the ImGui and UiForge bindings. DO NOT `require` these in your scripts, that will break your Lua environment.
 
 ## License
 
@@ -112,4 +114,3 @@ This project is licensed under the MIT License. See the [LICENSE.txt](LICENSE.tx
 ## Contributing
 
 Contributions are welcome! If you want to help improve the project, open an issue or submit a pull request. Feel free to suggest features or report bugs.
-  

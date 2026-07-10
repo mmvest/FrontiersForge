@@ -1,10 +1,8 @@
 local ffi = require("ffi")
 local util = require("frontiers_forge.util")
 
--- A quest log entry is nothing but a fixed-size UTF-16 title string. The
--- client keeps no other quest data. Ids, descriptions, and task state are all
--- server-side and only ever arrive as dialogue text. The quest log window
--- (VIWndQuestLog) renders these titles directly.
+-- A quest log entry is nothing but a fixed-size UTF-16 title string. The client
+-- keeps no other quest data, everything else is server-side dialogue text.
 ffi.cdef[[
     typedef struct {
         wchar_t name[128];  // +0x00  quest title, UTF-16, null terminated

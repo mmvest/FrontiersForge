@@ -3,40 +3,12 @@ local ffi = require("ffi")
 local bit = require("bit")
 
 -- Combat event capture via a code-cave hook on the server-message dispatcher.
---
--- Server opcode 0xDB is the only combat "number" message. Its payload is
--- { attacker_entity_id : u32, amount : signed varint, defender_entity_id : u32 }
--- where amount < 0 is damage and amount > 0 is healing. The server only sends
--- events that involve the local player. The client's own handling of this
--- message is purely visual, accumulates nothing, and is gated on the
--- "Damage Numbers" option so to build a damage meter (which is the whole point
--- of this module) we hook the dispatcher case itself and copy every event into
--- a ring buffer in unused EE memory, which Lua then polls.
---
--- The 0xDB case looks like:
---     0x0062FB24  lw a1,0x8DC(sp)     <- PATCH SITE (attacker id load)
---     0x0062FB28  lw v0,0x71F8(s4)    (local player id)
---     0x0062FB2C  bne a1,v0,...       (route outgoing vs incoming)
---     0x0062FB30  _lw a2,0x8E0(sp)    (amount, in branch delay slot)
--- We replace exactly the lw at +0x00 with `jal cave`. The
--- delay slot executes the original `lw v0` load, then the cave performs the
--- displaced `lw a1`, copies {attacker, defender, amount} + a sequence number
--- into the ring buffer, and returns with `jr ra`. ra is dead at this point
--- (the very next thing the original code does on either branch path is a jal,
--- and ra is saved/restored by the function prologue/epilogue), and the cave
--- only clobbers caller-saved temp registers that cannot be live immediately
--- after the preceding jal returns. Game behavior is completely unchanged and
--- the original routing and floating numbers still happen.
---
--- The patch site is found at runtime by computing the overlay slide from the
--- VIWndGame draw-function pointer and verifying an exact 4-instruction signature
--- at the computed address. If the signature check fails we fall back to
--- scanning for the signature, and if that fails too we refuse to install so we
--- don't break all the things.
---
--- Uninstalling restores the single original instruction after which nothing in the
--- game can reach the cave. The cave and buffer are then zeroed back to the empty
--- state they were verified to be in before install.
+-- Server opcode 0xDB is the only combat "number" message, but the client's
+-- handling is purely visual and option-gated, so to build a damage meter we hook
+-- the dispatcher case and copy every event into a ring buffer Lua polls. The
+-- patch site is resolved from the VIWndGame overlay slide and verified against an
+-- exact instruction signature (with a scan fallback) before any write, and
+-- uninstalling restores the original instruction then zeroes the cave.
 
 local Combat = {}
 
@@ -60,9 +32,8 @@ local ORIGINAL_OPCODE = SITE_SIGNATURE[1]
 local SCAN_START = 0x00300000
 local SCAN_END   = 0x01800000
 
--- 0x000F0000 sits in the EE kernel-reserved region below the ELF load address (remember ELF loads at 0x100000). 
--- This is the same region PS2 cheat devices often used to hook code, so I assume that EQOA never touches it.
--- Try to verify it is all zeros before installing to be extra sure it is good to use as a code cave.
+-- 0x000F0000 sits in the EE kernel-reserved gap below the ELF load address, so
+-- EQOA never touches it. Verified all-zero before install to be safe.
 local CAVE_CODE_OFFSET = 0x000F0000
 local BUF_OFFSET       = 0x000F0080
 -- Buffer header: +0x0 total event counter (u32), +0x4 magic, +0x8/+0xC reserved because who knows what I'll need to add later.

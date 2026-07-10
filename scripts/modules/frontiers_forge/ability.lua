@@ -1,8 +1,7 @@
 local ffi = require("ffi")
 local util = require("frontiers_forge.util")
 
--- The player's abilities appear to live in a single array of these records
--- with size 0x1D8. Index 0 is the null sentinel which is never a real ability.
+-- One record per ability, stride 0x1D8. Index 0 is the null sentinel.
 ffi.cdef[[
     typedef struct {
         uint32_t tree_meta;             // +0x00  not really sure what this is
@@ -15,11 +14,7 @@ ffi.cdef[[
         uint32_t valid;                 // +0x1C  nonzero when this record holds a real ability?
         uint32_t spellbook_slot;        // +0x20  spellbook position; 0-4 also appear on the hotbar,
                                         //        0xFC-0xFF are the specific items placed in hotbar slots 5-8
-        int32_t  cooldown_lockout_ms;   // +0x24  total lockout duration in ms while the ability is on
-                                        //        cooldown, 0 when ready. Equals (cast_time + cooldown)
-                                        //        * 1000 + 300. Server sent, constant while set (NOT a
-                                        //        countdown). Drives the dim overlay icon on the
-                                        //        hotbar slot.
+        int32_t  cooldown_lockout_ms;   // +0x24  total lockout in ms while on cooldown, 0 when ready
         uint32_t unknown_28;            // +0x28
         uint32_t level;                 // +0x2C
         float    range;                 // +0x30
@@ -149,6 +144,20 @@ end
 --- @return integer lockout_ms Total lockout in ms, or 0 when the ability is ready.
 function Ability:GetCooldownLockoutMs()
     return self.ptr.cooldown_lockout_ms
+end
+
+--- Whether two world points are within this ability's range of each other.
+--- Self scoped abilities and abilities with a range of 0 are always in range.
+--- @param point_a table Point with x, y, and z fields.
+--- @param point_b table Point with x, y, and z fields.
+--- @return boolean in_range True when the distance between the points is within the ability's range.
+--- @return number distance Distance between the two points.
+function Ability:IsInRange(point_a, point_b)
+    local distance = util.GetDistanceBetween(point_a, point_b)
+    if self.ptr.scope == Ability.Scope.SELF or self.ptr.range == 0 then
+        return true, distance
+    end
+    return distance <= self.ptr.range, distance
 end
 
 --- @return string name The ability name converted to UTF-8.

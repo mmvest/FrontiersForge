@@ -70,21 +70,115 @@ AbilityBar.__index = AbilityBar
 AbilityBar.num_bars = 3
 AbilityBar.slot_size = 0x20         -- 32 bytes
 
-local FOCUSED_WINDOW_PTR_OFFSET = 0x4E37F4
 local bar_window_offsets = { [0] = 0x6B0, [1] = 0x6B4, [2] = 0x6B8 }
 
--- Resolves the offset of a bar's config block, or nil if the UI windows
--- aren't loaded yet (e.g. not in game).
-local function GetBarConfigOffset(bar_index)
+local MAX_SLOT_COUNT = 5
+
+-- Resolves the game-UI root window. Returns nil when the UI is not loaded or a
+-- read fails validation.
+local function GetGameUIRootOffset()
+    if Util.IsInGame() == 0 then
+        return nil
+    end
+    local root = Util.ReadFromPointerChain(0x4E37F0, {0x2BB74}, "uint32_t", 0)
+    if not Util.IsValidEEPointer(root) or root + 0x720 > Util.EE_RAM_SIZE then
+        return nil
+    end
+    return root
+end
+
+-- Resolves a bar's VIWndHUDMenu window, or nil when unavailable.
+local function GetBarWindowOffset(bar_index)
     if bar_index < 0 or bar_index >= AbilityBar.num_bars then
         error("Invalid bar index: " .. tostring(bar_index))
     end
+    local root = GetGameUIRootOffset()
+    if root == nil then
+        return nil
+    end
+    local bar_window = Util.ReadFromOffset(root + bar_window_offsets[bar_index], "uint32_t")
+    if not Util.IsValidEEPointer(bar_window) or bar_window + 0x1D0 > Util.EE_RAM_SIZE then
+        return nil
+    end
+    if Util.ReadFromOffset(bar_window + 0x28, "uint32_t") ~= bar_index then
+        return nil
+    end
+    return bar_window
+end
 
-    local config_offset = Util.ReadFromPointerChain(FOCUSED_WINDOW_PTR_OFFSET, {0x14, bar_window_offsets[bar_index], 0x24}, "uint32_t", 0)
-    if config_offset == 0 then
+-- Resolves the offset of a bar's config block, or nil when unavailable.
+local function GetBarConfigOffset(bar_index)
+    local bar_window = GetBarWindowOffset(bar_index)
+    if bar_window == nil then
+        return nil
+    end
+    local config_offset = Util.ReadFromOffset(bar_window + 0x24, "uint32_t")
+    if not Util.IsValidEEPointer(config_offset) then
         return nil
     end
     return config_offset
+end
+
+--- Index of the hotbar the player currently has selected.
+--- @return integer|nil bar_index Bar index from 0 to AbilityBar.num_bars - 1, or nil when the UI is not loaded.
+function AbilityBar.GetSelectedBarIndex()
+    local root = GetGameUIRootOffset()
+    if root == nil then
+        return nil
+    end
+    local index = Util.ReadFromOffset(root + 0x54, "uint32_t")
+    if index >= AbilityBar.num_bars then
+        return nil
+    end
+    return index
+end
+
+--- Slot the player currently has selected on a bar.
+--- @param bar_index integer Bar index from 0 to AbilityBar.num_bars - 1.
+--- @return integer|nil slot_index Slot index from 0 to GetSlotCount(bar_index) - 1, or nil when the UI is not loaded.
+function AbilityBar.GetSelectedSlotIndex(bar_index)
+    local bar_window = GetBarWindowOffset(bar_index)
+    if bar_window == nil then
+        return nil
+    end
+    local slot_index = Util.ReadFromOffset(bar_window + 0x1C8, "uint32_t")
+    if slot_index > MAX_SLOT_COUNT then
+        return nil
+    end
+    return slot_index
+end
+
+-- Slide sources, identical to chat.lua / combat.lua / input.lua.
+local WND_GAME_STATIC_PTR  = 0x14E200
+local WND_GAME_DRAW_STEPS  = { 0x190, 0x53C, 0x20, 0x1C }
+local WND_GAME_DRAW_STATIC = 0x006AD8D8
+
+-- The compact hotbar draw pulls each slot's glyph from a static texture id table
+-- (0x7466E0 in the dump), indexed by slot position — not from the slot data.
+local SLOT_GLYPH_TABLE_STATIC = 0x7466E0
+
+--- Built-in UI texture id of a slot position's glyph (what the compact HUD draws
+--- in that slot, e.g. the special-items bar's bottle/gem/sword icons).
+--- Resolve it to a texture with Icon.GetUITexture.
+--- @param slot_index integer Slot index from 0 to MAX_SLOT_COUNT - 1.
+--- @return integer|nil tex_id UI texture id, or nil when the UI is not loaded.
+function AbilityBar.GetSlotUITexId(slot_index)
+    if slot_index < 0 or slot_index >= MAX_SLOT_COUNT then
+        error("Invalid slot index: " .. tostring(slot_index))
+    end
+    local draw_ptr_offset = Util.GetOffsetFromPointerChain(WND_GAME_STATIC_PTR, WND_GAME_DRAW_STEPS)
+    if draw_ptr_offset == nil then
+        return nil
+    end
+    local draw_runtime = Util.ReadFromOffset(draw_ptr_offset, "uint32_t")
+    if not Util.IsValidEEPointer(draw_runtime) then
+        return nil
+    end
+    local table_offset = SLOT_GLYPH_TABLE_STATIC + (draw_runtime - WND_GAME_DRAW_STATIC)
+    if not Util.IsValidEEPointer(table_offset) then
+        return nil
+    end
+    return Util.ReadFromOffset(table_offset + slot_index * 4, "uint32_t")
 end
 
 --- Number of slots currently on a bar.
@@ -95,7 +189,11 @@ function AbilityBar.GetSlotCount(bar_index)
     if config == nil then
         return 0
     end
-    return Util.ReadFromOffset(config + 0xC, "uint32_t")
+    local count = Util.ReadFromOffset(config + 0xC, "uint32_t")
+    if count > MAX_SLOT_COUNT then
+        return 0
+    end
+    return count
 end
 
 --- Get a slot object from a bar.
@@ -112,9 +210,13 @@ function AbilityBar.GetAbilitySlot(bar_index, slot_index)
     end
 
     local slots_offset = Util.ReadFromOffset(config + 0x8, "uint32_t")
-    local slot_address = Util.EEmem() + slots_offset + (AbilityBar.slot_size * slot_index)
+    local slot_offset = slots_offset + (AbilityBar.slot_size * slot_index)
+    if not Util.IsValidEEPointer(slots_offset)
+        or slot_offset + AbilityBar.slot_size > Util.EE_RAM_SIZE then
+        return nil
+    end
 
-    return AbilityBarSlot.new(slot_address)
+    return AbilityBarSlot.new(Util.EEmem() + slot_offset)
 end
 
 --- Convenience wrapper resolving a bar slot straight to an Ability object.

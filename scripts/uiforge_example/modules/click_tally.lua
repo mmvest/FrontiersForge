@@ -1,7 +1,7 @@
 -- click_tally.lua
 -- A deliberately simple module that lives inside this script package's own
 -- modules folder. It is found by require("click_tally") because UiForge
--- prepends "test_window_01\modules" to package.path while this package's
+-- prepends "uiforge_example\modules" to package.path while this package's
 -- script runs. A module with the same name in the shared scripts\modules
 -- directory would be shadowed by this one.
 

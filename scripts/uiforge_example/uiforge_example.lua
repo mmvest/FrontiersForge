@@ -1,13 +1,37 @@
-local  bit = require("bit")
+-- uiforge_example.lua
+-- A single tour of UiForge's features. Widgets, drawing, window flags,
+-- packaged modules and resources, fonts, audio, and an animated bouncing
+-- balls demo wired into the Settings/Save/Load callbacks.
+
+local bit = require("bit")
 
 -- click_tally lives in this package's own modules folder
--- (scripts\test_window_01\modules\click_tally.lua). No entry in the shared
+-- (scripts\uiforge_example\modules\click_tally.lua). No entry in the shared
 -- scripts\modules directory is needed. Because modules are cached by
 -- require, the tally persists across frames even though this script file
 -- re-runs every frame.
 local ClickTally = require("click_tally")
 
+-- ===============================
+-- Bouncing balls demo
+-- ===============================
+
+local Ball = {}
+Ball.__index = Ball
+
+function Ball:new(position, velocity, radius, color)
+    return setmetatable({
+        position = position,
+        velocity = velocity,
+        radius = radius,
+        color = color,
+    }, self)
+end
+
 state = state or {
+    callbacks_registered = false,
+
+    -- Basic widgets
     button_clicked      = false,
     checkbox_checked    = false,
     radio_buttons       = 0,
@@ -19,22 +43,174 @@ state = state or {
     combo_index         = 0,
     color4              = { 1, .5, .25, 1},
     progress_percent    = 0,
+
+    -- Drawing
     line_thickness      = 1,
     sides               = 5,
     line_color          = {0, 0, 0, 1},
+
+    -- Window flags
     demo_window_flags   = ImGuiWindowFlags.None,
     demo_cur_health     = 100,
     demo_max_health     = 100,
     demo_damage         = 10,
+
+    -- Images
     image_texture       = nil,
+    global_image_texture = nil,
     image_width         = 64,
     image_height        = 64,
     image_tint          = {1, 1, 1, 1},
-    image_border_col    = {0, 0, 0, 0}
+    image_border_col    = {0, 0, 0, 0},
 
+    -- Audio
+    sound_volume        = 1.0,
+    sound_loop          = false,
+
+    -- Bouncing balls
+    balls               = {},
+    ball_count          = 10,
+    ball_area           = {x = 400, y = 250},
+    last_frame_time     = 0,
 }
 
--- Make a window
+local function RandomFloat(min, max)
+    return min + math.random() * (max - min)
+end
+
+local function PopulateBalls(count, area)
+    state.balls = {}
+    for i = 1, count do
+        local radius = RandomFloat(10, 20)
+        local position = {
+            x = RandomFloat(radius, area.x - radius),
+            y = RandomFloat(radius, area.y - radius),
+        }
+        local velocity = {
+            x = math.random(2) == 1 and RandomFloat(-15, -8) or RandomFloat(8, 15),
+            y = math.random(2) == 1 and RandomFloat(-15, -8) or RandomFloat(8, 15),
+        }
+        local color = RandomFloat(0xFF000000, 0xFFFFFFFF)
+        table.insert(state.balls, Ball:new(position, velocity, radius, color))
+    end
+end
+
+local function UpdateBalls(delta_time, area)
+    for i = 1, #state.balls do
+        local ball = state.balls[i]
+
+        ball.position.x = ball.position.x + ball.velocity.x * delta_time
+        ball.position.y = ball.position.y + ball.velocity.y * delta_time
+
+        -- Bounce off edges
+        if ball.position.x - ball.radius < 0 or ball.position.x + ball.radius > area.x then
+            ball.velocity.x = -ball.velocity.x
+        end
+        if ball.position.y - ball.radius < 0 or ball.position.y + ball.radius > area.y then
+            ball.velocity.y = -ball.velocity.y
+        end
+
+        -- Ball-to-ball collisions, resolved by swapping velocities
+        for j = i + 1, #state.balls do
+            local other = state.balls[j]
+            local dx = ball.position.x - other.position.x
+            local dy = ball.position.y - other.position.y
+            local distance = math.sqrt(dx * dx + dy * dy)
+            if distance < ball.radius + other.radius then
+                ball.velocity, other.velocity = other.velocity, ball.velocity
+            end
+        end
+    end
+end
+
+local function RenderBalls(origin)
+    local draw_list = ImGui.GetWindowDrawList()
+    for _, ball in ipairs(state.balls) do
+        draw_list:AddCircleFilled(ImVec2.new(origin.x + ball.position.x, origin.y + ball.position.y), ball.radius, ball.color)
+    end
+end
+
+-- ===============================
+-- Callbacks (Settings / Save / Load)
+-- ===============================
+
+-- Rendered inside the UiForge Settings panel when this script is selected
+local function Settings()
+    local value, clicked = ImGui.SliderInt("Number of Balls", state.ball_count, 1, 100)
+    if value ~= state.ball_count and clicked then
+        state.ball_count = value
+        PopulateBalls(state.ball_count, state.ball_area)
+    end
+end
+
+-- Save callback. Returns a plain-data table describing the current simulation.
+-- The core captures it into the profile being saved (File > Save Profile).
+local function Save()
+    local saved_balls = {}
+    for i, ball in ipairs(state.balls) do
+        saved_balls[i] = {
+            position = { x = ball.position.x, y = ball.position.y },
+            velocity = { x = ball.velocity.x, y = ball.velocity.y },
+            radius   = ball.radius,
+            color    = ball.color,
+        }
+    end
+
+    return {
+        ball_count = state.ball_count,
+        balls      = saved_balls,
+    }
+end
+
+-- Load callback. Receives the table produced by Save when a profile is applied
+-- and rebuilds the simulation from it, so the balls jump back to their saved spots.
+local function Load(saved_state)
+    if type(saved_state) ~= "table" then
+        return
+    end
+
+    if saved_state.ball_count then
+        state.ball_count = saved_state.ball_count
+    end
+
+    if type(saved_state.balls) == "table" then
+        state.balls = {}
+        for i, saved_ball in ipairs(saved_state.balls) do
+            state.balls[i] = Ball:new(
+                { x = saved_ball.position.x, y = saved_ball.position.y },
+                { x = saved_ball.velocity.x, y = saved_ball.velocity.y },
+                saved_ball.radius,
+                saved_ball.color
+            )
+        end
+    end
+end
+
+if state.callbacks_registered == false then
+    UiForge.RegisterCallback(UiForge.CallbackType.Settings, Settings)
+    UiForge.RegisterCallback(UiForge.CallbackType.Save, Save)
+    UiForge.RegisterCallback(UiForge.CallbackType.Load, Load)
+    state.callbacks_registered = true
+end
+
+-- ===============================
+-- Fonts and audio (loaded once, cached by UiForge)
+-- ===============================
+
+-- LoadFont always returns a usable font, falling back to the default font when
+-- the file is missing or fails to load, so PushFont is always safe.
+local times_font = UiForge.LoadFont("C:\\Windows\\Fonts\\times.ttf", 20.0)
+local times_font_large = UiForge.LoadFont("C:\\Windows\\Fonts\\times.ttf", 36.0)
+local missing_font = UiForge.LoadFont("C:\\Windows\\Fonts\\does_not_exist.ttf", 20.0)
+
+-- LoadSound returns nil when the file cannot be opened, and every other sound
+-- function safely accepts a nil handle. This clip ships with every Windows install.
+local tada_sound = UiForge.LoadSound("C:\\Windows\\Media\\tada.wav")
+
+-- ===============================
+-- Main window
+-- ===============================
+
 if ImGui.Begin("Hello, UiForge!", true, ImGuiWindowFlags.MenuBar) then
     -- Menu Bars
     if ImGui.BeginMenuBar() then
@@ -66,10 +242,9 @@ if ImGui.Begin("Hello, UiForge!", true, ImGuiWindowFlags.MenuBar) then
         -- Button
         if ImGui.Button("Click Me!", 200, 50) then
             state.button_clicked = not state.button_clicked
-        end   -- Make Buttons like this
+        end
         if state.button_clicked then
             ImGui.Text("Button Clicked!")
-        
         end
 
         -- Checkbox
@@ -113,7 +288,6 @@ if ImGui.Begin("Hello, UiForge!", true, ImGuiWindowFlags.MenuBar) then
         state.slider_float = ImGui.SliderFloat("Float Slider", state.slider_float, 0, 1.0)
         state.slider_int = ImGui.SliderInt("Int Slider", state.slider_int, 0, 10, "Slider Text: " .. state.slider_int)
 
-
         -- Color Picker
         state.color4 = ImGui.ColorEdit4("Color Picker", state.color4)
 
@@ -153,15 +327,8 @@ if ImGui.Begin("Hello, UiForge!", true, ImGuiWindowFlags.MenuBar) then
         ImGui.TreePop()
     end
 
-    -- Seperator
     ImGui.Separator()
 
-    -- use ImVec2 and ImVec4
-    local vec2 = ImVec2.new(10.0, 21.0)
-    local vec4 = ImVec4.new(1, 2, 3, 4)
-    -- ImGui.Text("ImVec2: " .. vec2.x .. ", " .. vec2.y)
-    -- ImGui.Text("ImVec4: " .. vec4.x .. ", " .. vec4.y .. ", " .. vec4.z .. ", " .. vec4.w)
-    
     if ImGui.TreeNode("Drawing") then
         -- Draw Primitives
         local draw_list = ImGui.GetWindowDrawList()
@@ -199,10 +366,7 @@ if ImGui.Begin("Hello, UiForge!", true, ImGuiWindowFlags.MenuBar) then
         ImGui.TreePop()
     end
 
-    -- Window Flags
-
     if ImGui.TreeNode("Window Flags") then
-        
         local flags = {
             { name = "No Title Bar",                flag = ImGuiWindowFlags.NoTitleBar },
             { name = "No Resize",                   flag = ImGuiWindowFlags.NoResize },
@@ -249,7 +413,7 @@ if ImGui.Begin("Hello, UiForge!", true, ImGuiWindowFlags.MenuBar) then
         end
 
         ImGui.End()
-    
+
         ImGui.TreePop()
     end
 
@@ -278,7 +442,7 @@ if ImGui.Begin("Hello, UiForge!", true, ImGuiWindowFlags.MenuBar) then
         if state.image_texture == nil then
             -- PER PACKAGE RESOURCE
             -- Relative paths resolve against this package's own resources folder
-            -- first (scripts\test_window_01\resources), then fall back to the
+            -- first (scripts\uiforge_example\resources), then fall back to the
             -- shared scripts\resources directory.
             state.image_texture = UiForge.LoadTexture("gear-icon.png")
         end
@@ -296,22 +460,10 @@ if ImGui.Begin("Hello, UiForge!", true, ImGuiWindowFlags.MenuBar) then
             state.image_height = ImGui.SliderInt("Image Height", state.image_height, 32, 128)
             state.image_tint = ImGui.ColorEdit4("Image Tint", state.image_tint)
             state.image_border_col = ImGui.ColorEdit4("Image Border Color", state.image_border_col)
-            
-            -- local image_tint = ImGui.GetColorU32(state.image_tint[1], state.image_tint[2], state.image_tint[3] , state.image_tint[4])
-            -- local image_border_col = ImGui.GetColorU32(state.image_border_col[1], state.image_border_col[2], state.image_border_col[3] , state.image_border_col[4])
-            
+
             -- Simplified image call, drawing the PER PACKAGE copy of the icon
             ImGui.Image(state.image_texture, state.image_width, state.image_height)
             ImGui.SameLine()
-            
-            -- Advanced image calls
-            -- ImGui.GetWindowDrawList():AddImage( state.image_texture,
-            --                                     ImVec2.new(0,0),
-            --                                     ImVec2.new(state.image_width, state.image_height),
-            --                                     ImVec2.new(0,0),
-            --                                     ImVec2.new(1,1),
-            --                                     ImGui.GetColorU32(state.image_tint[1], state.image_tint[2], state.image_tint[3] , state.image_tint[4])
-            --                                   )
             ImGui.Dummy(state.image_width, state.image_height)
             ImGui.SameLine()
 
@@ -333,6 +485,75 @@ if ImGui.Begin("Hello, UiForge!", true, ImGuiWindowFlags.MenuBar) then
         ImGui.TreePop()
     end
 
+    if ImGui.TreeNode("Fonts") then
+        ImGui.Text("This line uses the default font.")
+
+        ImGui.PushFont(times_font)
+        ImGui.Text("This line uses Times New Roman at 20px.")
+        ImGui.PopFont()
+
+        ImGui.PushFont(times_font_large)
+        ImGui.Text("This line uses Times New Roman at 36px.")
+        ImGui.PopFont()
+
+        ImGui.PushFont(missing_font)
+        ImGui.Text("This line asked for a missing font and fell back to the default.")
+        ImGui.PopFont()
+        ImGui.TreePop()
+    end
+
+    if ImGui.TreeNode("Audio") then
+        if tada_sound == nil then
+            ImGui.Text("Could not load C:\\Windows\\Media\\tada.wav")
+        else
+            ImGui.Text("Sound handle: " .. tada_sound)
+            ImGui.Text("IsSoundPlaying: " .. tostring(UiForge.IsSoundPlaying(tada_sound)))
+
+            if ImGui.Button("Play") then
+                UiForge.PlaySound(tada_sound, {
+                    volume = state.sound_volume,
+                    loop = state.sound_loop,
+                })
+            end
+            ImGui.SameLine()
+            if ImGui.Button("Stop") then
+                UiForge.StopSound(tada_sound)
+            end
+
+            local volume, changed = ImGui.SliderFloat("Volume", state.sound_volume, 0.0, 1.0)
+            if changed then
+                state.sound_volume = volume
+                -- Takes effect immediately, even while the sound is playing.
+                UiForge.SetSoundVolume(tada_sound, volume)
+            end
+
+            state.sound_loop = ImGui.Checkbox("Loop", state.sound_loop)
+        end
+        ImGui.TreePop()
+    end
+
+    if ImGui.TreeNode("Bouncing Balls") then
+        ImGui.Text("The ball count lives in this script's Settings callback,")
+        ImGui.Text("and the simulation is captured by the Save/Load callbacks (profiles).")
+
+        local current_time = ImGui.GetTime()
+        local delta_time = current_time - state.last_frame_time
+        state.last_frame_time = current_time
+
+        if ImGui.BeginChild("BallArea", state.ball_area.x, state.ball_area.y, ImGuiChildFlags.Border) then
+            local origin = {}
+            origin.x, origin.y = ImGui.GetCursorScreenPos()
+
+            if #state.balls ~= state.ball_count then
+                PopulateBalls(state.ball_count, state.ball_area)
+            end
+
+            UpdateBalls(delta_time, state.ball_area)
+            RenderBalls(origin)
+        end
+        ImGui.EndChild()
+        ImGui.TreePop()
+    end
 end
 
 --end the window

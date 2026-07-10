@@ -1,18 +1,9 @@
 local ffi = require("ffi")
 local Util = require("frontiers_forge.util")
 
--- Group information lives in the client-state singleton, reached the same way
--- ability_list.lua does it: the static pointer at 0x4E37F0 points at
--- singleton + 4, so each singleton-relative offset below is resolved with a
--- single pointer-chain step of (offset - 4).
---
--- Singleton-relative offsets:
---   +0x2BD74 = in-group flag
---   +0x2BD78 = self-is-leader flag
---   +0x2BD7C = member record array (stride 0x34)
---   +0x2BE4C = member count
---
--- Note the member array includes the local player as one of its entries.
+-- Group information lives in the client-state singleton, resolved through the
+-- static pointer at 0x4E37F0 which points at singleton + 4 (so each chain step is
+-- offset - 4). The member array includes the local player as one of its entries.
 ffi.cdef[[
     typedef struct {
         uint32_t entity_id;         // +0x00

@@ -1,5 +1,5 @@
-local ffi  = require("ffi")
 local Util = require("frontiers_forge.util")
+local Item = require("frontiers_forge.item")
 
 local Inventory = {}
 
@@ -9,88 +9,15 @@ local Inventory = {}
 
 local PLAYER_OFFSET = 0x1FBBA0C
 
-local STRIDE    = 0x02FC
-local NUM_SLOTS = 40
+-- Item records start at PLAYER_OFFSET + 0x154, per-field reads live in item.lua
+local RECORD_BASE = PLAYER_OFFSET + 0x154
+local STRIDE      = 0x02FC
+local NUM_SLOTS   = 40
 
--- Equipped Flag meanings
-local U32_NOT_EQUIPPED = 0xFFFFFFFF
-local U32_ALT_INVALID  = 429496725  -- fallback
+Inventory.max_slots = NUM_SLOTS
 
-local function is_not_equipped_value(v)
-    return v == U32_NOT_EQUIPPED or v == U32_ALT_INVALID
-end
-
--- ===============================
--- Base offsets (slot 1)
--- ===============================
-
-local BASE = {
-    ["Slot"]          = 0x0168,
-    ["Range"]         = 0x0184,
-    ["Level Req"]     = 0x0188,
-    ["Max Stack"]     = 0x018C,
-    ["Max HP"]        = 0x0190,
-    ["Dur"]           = 0x0194,
-    ["Name"]          = 0x01B0,  -- UTF-16 string
-    ["Amount"]        = 0x0438,  -- uint32
-    ["Equipped Flag"] = 0x0444,  -- uint32
-}
-
--- ===============================
--- Precompute per-slot offsets (LOCAL)
--- ===============================
-
-local Offsets = {}
-for i = 1, NUM_SLOTS do
-    local t = {}
-    local add = (i - 1) * STRIDE
-    for k, v in pairs(BASE) do
-        t[k] = v + add
-    end
-    Offsets[i] = t
-end
-
-local function addr(slot, field)
-    return PLAYER_OFFSET + Offsets[slot][field]
-end
-
--- ===============================
--- Internal low-level readers (LOCAL)
--- ===============================
-
-local function read_uint(slot, field, ctype)
-    return Util.ReadFromOffset(addr(slot, field), ctype or "uint32_t")
-end
-
-local function read_name(slot)
-    local wptr = ffi.cast("const wchar_t*", Util.EEmem() + addr(slot, "Name"))
-    local s = Util.utf16_to_utf8(wptr)
-    if not s or s == "" then return "" end
-    return s
-end
-
-local function read_amount(slot)
-    return read_uint(slot, "Amount", "uint32_t")
-end
-
-local function read_slot_id(slot)
-    return read_uint(slot, "Slot", "uint32_t")
-end
-
-local function read_equipped_status(slot)
-    local slot_id = read_slot_id(slot)
-    local v       = read_uint(slot, "Equipped Flag", "uint32_t")
-
-    -- Empty detection: use Slot ID, not Equipped Flag
-    if slot_id == 0 then
-        return "Empty"
-    end
-
-    if is_not_equipped_value(v) then
-        return "Not Equipped"
-    end
-
-    return "Equipped"
+local function record_offset(slot)
+    return RECORD_BASE + (slot - 1) * STRIDE
 end
 
 -- ===============================
@@ -144,13 +71,6 @@ function Inventory.GetSlotLabelAndOrder(slot_id)
     return base, 999
 end
 
-local function get_slot_label(slot_id)
-    local label = SLOT_LABEL[slot_id]
-    if not label then return ("Slot " .. tostring(slot_id)) end
-    if label == "Weapon" then return "Weapon" end
-    return label
-end
-
 -- ===============================
 -- Inventory metadata (PUBLIC)
 -- ===============================
@@ -168,6 +88,45 @@ function Inventory.SlotsUsed()
     return Inventory.InventoryUsed()
 end
 
+--- Number of free inventory slots.
+--- @return integer remaining Slots left from 0 to max_slots.
+function Inventory.SlotsRemaining()
+    local used = Inventory.SlotsUsed() or 0
+    if used < 0 then used = 0 end
+    if used > NUM_SLOTS then used = NUM_SLOTS end
+    return NUM_SLOTS - used
+end
+
+--- Icon resource hash for an inventory slot, usable with Icon.GetTexture.
+--- @param slot integer Inventory index from 1 to 40 (same idx as GetItems entries).
+--- @return integer|nil icon_ref Icon hash, or nil when the slot is empty or out of range.
+function Inventory.GetIconRef(slot)
+    if slot < 1 or slot > NUM_SLOTS then
+        return nil
+    end
+    local record = record_offset(slot)
+    if Item.GetSlotId(record) == 0 then
+        return nil
+    end
+    return Item.GetIconRef(record)
+end
+
+--- Item object for one inventory slot (see Item.new), with idx set.
+--- @param slot integer Inventory index from 1 to 40.
+--- @return table|nil item Item object with live methods and properties, or nil when the slot is empty or out of range.
+function Inventory.GetItem(slot)
+    if slot < 1 or slot > NUM_SLOTS then
+        return nil
+    end
+    local record = record_offset(slot)
+    if Item.GetSlotId(record) == 0 or Item.GetName(record) == "" then
+        return nil
+    end
+    local item = Item.new(record)
+    item.idx = slot
+    return item
+end
+
 -- ===============================
 -- Public API: GetItems()
 -- ===============================
@@ -180,26 +139,9 @@ function Inventory.GetItems()
     if used > NUM_SLOTS then used = NUM_SLOTS end
 
     for i = 1, used do
-        local slot_id = read_slot_id(i)
-        if slot_id ~= 0 then
-            local name = read_name(i)
-            if name ~= "" then
-                local equipped_status = read_equipped_status(i)
-
-                items[#items + 1] = {
-                    idx             = i,
-                    slot            = slot_id,
-                    name            = name,
-                    amount          = read_amount(i),
-                    level_req       = read_uint(i, "Level Req", "uint32_t"),
-                    equipped        = (equipped_status == "Equipped"),
-                    equipped_status = equipped_status,
-                    range           = read_uint(i, "Range", "uint32_t"),
-                    max_stack       = read_uint(i, "Max Stack", "uint32_t"),
-                    max_hp          = read_uint(i, "Max HP", "uint32_t"),
-                    dur             = read_uint(i, "Dur", "uint32_t"),
-                }
-            end
+        local item = Inventory.GetItem(i)
+        if item ~= nil then
+            items[#items + 1] = item
         end
     end
 

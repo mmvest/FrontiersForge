@@ -871,30 +871,38 @@ local function Render()
             for entity_index = 2, #entity_list do
                 local entity = entity_list[entity_index]
 
+                -- Entity objects read live memory on every property access, so
+                -- capture each field once per frame instead of re-reading it
+                -- at every use below.
+                local entity_id = entity:GetId()
+                local entity_name = entity:GetName()
+                local entity_level = entity:GetLevel()
+                local entity_x, entity_y, entity_z = entity:GetPosition()
+
                 -- When entities despawn, memory can transiently contain "empty slot" data.
                 -- Skip obviously-invalid entries to avoid rendering artifacts and tooltip issues.
-                if entity ~= nil and entity.id ~= 0 and entity.name ~= "" then
+                if entity_id ~= 0 and entity_name ~= "" then
                     -- Calculate the entity's position on the mini-map
-                    local entity_map_x = entity.x * world_to_map_texture_scale_factor_x
-                    local entity_map_z = entity.z * world_to_map_texture_scale_factor_z
+                    local entity_map_x = entity_x * world_to_map_texture_scale_factor_x
+                    local entity_map_z = entity_z * world_to_map_texture_scale_factor_z
                     local distance = {x = entity_map_x - player_map_texture_x, z = entity_map_z - player_map_texture_z }
                     local circle_center = ImVec2.new(mini_map_center.x + distance.x, mini_map_center.y + distance.z)
 
                 local player_level = Player.GetLevel()
                 local fill_color_u32 = state.entity_white_color
-                if      entity.level - 2    >   player_level then fill_color_u32 = state.entity_red_color
-                elseif  entity.level - 1    >=  player_level then fill_color_u32 = state.entity_yellow_color
-                elseif  entity.level        ==  player_level then fill_color_u32 = state.entity_white_color
-                elseif  entity.level + 1    ==  player_level then fill_color_u32 = state.entity_dark_blue_color
-                elseif  entity.level + 2    ==  player_level then fill_color_u32 = state.entity_light_blue_color
-                elseif  entity.level + 5    <=  player_level then fill_color_u32 = state.entity_gray_color
-                elseif  entity.level + 3    <=  player_level then fill_color_u32 = state.entity_green_color
+                if      entity_level - 2    >   player_level then fill_color_u32 = state.entity_red_color
+                elseif  entity_level - 1    >=  player_level then fill_color_u32 = state.entity_yellow_color
+                elseif  entity_level        ==  player_level then fill_color_u32 = state.entity_white_color
+                elseif  entity_level + 1    ==  player_level then fill_color_u32 = state.entity_dark_blue_color
+                elseif  entity_level + 2    ==  player_level then fill_color_u32 = state.entity_light_blue_color
+                elseif  entity_level + 5    <=  player_level then fill_color_u32 = state.entity_gray_color
+                elseif  entity_level + 3    <=  player_level then fill_color_u32 = state.entity_green_color
                 end
 
                 local is_tracked = false
                 local tracked_border_color = default_border_color
                 if tracking_enabled then
-                    local tracked_index = state.tracked_entities_by_key[NormalizeEntityName(entity.name)]
+                    local tracked_index = state.tracked_entities_by_key[NormalizeEntityName(entity_name)]
                     if tracked_index ~= nil then
                         local tracked_entry = state.tracked_entities[tracked_index]
                         if tracked_entry ~= nil and tracked_entry.enabled ~= false then
@@ -936,9 +944,9 @@ local function Render()
                     if distance_squared <= state.entity_radius^2 then
                         ImGui.BeginTooltip()
                         -- ImGui.Text() is printf-style: treat entity names as untrusted and render unformatted.
-                        ImGui.TextUnformatted(entity.name .. "(" .. entity.level .. ")\n" ..
-                                "ID: " .. entity.id .. "\n" ..
-                                string.format("Coordinates: %.2f, %.2f, %.2f", entity.x, entity.y, entity.z))
+                        ImGui.TextUnformatted(entity_name .. "(" .. entity_level .. ")\n" ..
+                                "ID: " .. entity_id .. "\n" ..
+                                string.format("Coordinates: %.2f, %.2f, %.2f", entity_x, entity_y, entity_z))
                         ImGui.EndTooltip()
                     end
                 end

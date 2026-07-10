@@ -2,18 +2,12 @@ local ffi = require("ffi")
 local bit = require("bit")
 local Util = require("frontiers_forge.util")
 
--- Decodes game icon textures straight out of emulated PS2 memory so they can
--- be drawn with ImGui.Image. The game keys its UI art by 32 bit resource
--- hashes (the values in ability records at +0x3C and +0x40). The lookup path,
--- reversed from the game's hash based blit, is
---   [0x4E37F0] = UI object
---   UI object +0x48 = VIRaster, +0x50 = VIDictionary
---   dictionary node array (stride 0x1C) maps hash (+0x10) to a surface handle (+0x18)
---   VIRaster +0x4BBC = surface table (stride 0xC, first word = VISurface pointer)
---   VISurface holds width, height, pixel format, palette and a pointer to the
---   pixel buffer in EE RAM
--- Decoded pixels are uploaded once through UiForge.CreateTextureFromMemory and
--- cached by hash, so calling GetTexture every frame is cheap.
+-- Decodes game icon textures straight out of emulated PS2 memory so they can be
+-- drawn with ImGui.Image. The game keys its UI art by 32 bit resource hashes (the
+-- values in ability records at +0x3C and +0x40), looked up through the UI object at
+-- [0x4E37F0] into a dictionary and surface table. Decoded pixels are uploaded once
+-- through UiForge.CreateTextureFromMemory and cached by hash, so calling GetTexture
+-- every frame is cheap.
 
 local Icon = {}
 
@@ -342,6 +336,118 @@ function Icon.GetTexture(hash, options)
     return texture, w, h
 end
 
+-- Built-in UI textures (bar frames, hotbar slot glyphs, ...) are keyed by small
+-- texture ids instead of hashes.
+local UI_TEX_REGISTRY_OFFSET = 0x4EDAF8   -- static registry, stride 0x24
+local UI_TEX_COUNT           = 0xFC
+local UI_NAME_TEMPLATE       = "P:\\studio\\eqps2\\Game_Assets\\UI\\%s.tga"
+
+local ui_texture_cache = {}
+
+-- The game's resource id hash: h = h * 0x83 + byte over the full asset path.
+local function HashResourceID(str)
+    local h = 0
+    for i = 1, #str do
+        h = bit.tobit(h * 0x83 + str:byte(i))
+    end
+    if h < 0 then h = h + 4294967296 end
+    return h
+end
+
+-- Reads an entry (1-based index) from the UI string table, narrowed to ASCII.
+local function ReadUIString(index)
+    local ui = read_u32(GUI_CONTEXT_PTR_OFFSET)
+    if not Util.IsValidEEPointer(ui) then return nil end
+
+    local count = read_u32(ui + 0x10)
+    local langs = read_u32(ui + 0x14)
+    local base = read_u32(ui + 0x1C)
+    local lang = read_u32(ui + 0x30)
+    index = index - 1
+    if not Util.IsValidEEPointer(base) or index < 0 or index >= count or lang >= langs then
+        return nil
+    end
+
+    local str_offset = read_u32(base + (index * langs + lang) * 4)
+    if not Util.IsValidEEPointer(str_offset) then return nil end
+
+    local out = {}
+    for i = 0, 63 do
+        local ch = Util.ReadFromOffset(str_offset + i * 2, "uint16_t")
+        if ch == 0 then break end
+        out[#out + 1] = string.char(bit.band(ch, 0xFF))
+    end
+    return table.concat(out)
+end
+
+--- Gets an ImGui compatible texture for a built-in UI texture id (the id space used
+--- by the HUD's own frames and hotbar slot glyphs, 0 to 0xFB). Cached like GetTexture.
+--- @param tex_id integer UI texture id, for example AbilityBar.GetSlotUITexId(slot).
+--- @return userdata|nil texture Texture usable with ImGui.Image, or nil when unavailable.
+--- @return integer|nil width
+--- @return integer|nil height
+function Icon.GetUITexture(tex_id)
+    tex_id = tonumber(tex_id)
+    if tex_id == nil or tex_id < 0 or tex_id >= UI_TEX_COUNT then return nil end
+
+    local cached = ui_texture_cache[tex_id]
+    if cached == false then return nil end
+    if cached ~= nil then return cached.texture, cached.width, cached.height end
+
+    local function fail()
+        ui_texture_cache[tex_id] = false
+        return nil
+    end
+
+    local entry = UI_TEX_REGISTRY_OFFSET + tex_id * 0x24
+    local name_index = read_u32(entry + 0x4)
+    local src_x = read_u32(entry + 0x8)
+    local src_y = read_u32(entry + 0xC)
+    local w = read_u32(entry + 0x10)
+    local h = read_u32(entry + 0x14)
+
+    local name = ReadUIString(name_index)
+    if name == nil or name == "" or name == "_null_" then return fail() end
+
+    local surface = FindSurface(HashResourceID(string.format(UI_NAME_TEMPLATE, name)))
+    if surface == nil then return fail() end
+
+    local rgba, full_w, full_h = DecodeSurface(surface)
+    if rgba == nil then return fail() end
+    if w <= 0 or h <= 0 or src_x + w > full_w or src_y + h > full_h then return fail() end
+
+    local cropped = ffi.new("uint8_t[?]", w * h * 4)
+    for y = 0, h - 1 do
+        ffi.copy(cropped + y * w * 4, rgba + ((src_y + y) * full_w + src_x) * 4, w * 4)
+    end
+
+    local texture = UiForge.CreateTextureFromMemory(ffi.string(cropped, w * h * 4), w, h)
+    if texture == nil then return fail() end
+
+    ui_texture_cache[tex_id] = { texture = texture, width = w, height = h }
+    return texture, w, h
+end
+
+--- Looks up a resource hash and reports its raw surface properties without decoding.
+--- Useful for diagnosing icons that fail to decode (e.g. an unsupported pixel format).
+--- @param hash integer 32 bit resource hash.
+--- @return table|nil info { width, height, format, palette_count, palette_format }, or nil when not in the dictionary.
+function Icon.GetSurfaceInfo(hash)
+    hash = tonumber(hash)
+    if hash == nil or hash == 0 or hash == 0xFFFFFFFF then return nil end
+
+    local surface = FindSurface(hash)
+    if surface == nil then return nil end
+
+    return {
+        width          = read_u32(surface + 0x08),
+        height         = read_u32(surface + 0x0C),
+        format         = read_u32(surface + 0x10),
+        palette_count  = read_u32(surface + 0x28),
+        palette_format = read_u32(surface + 0x34),
+    }
+end
+
 --- Releases every cached texture and empties all caches. Call from a script
 --- disable callback so textures are not leaked across reloads.
 function Icon.ReleaseAll()
@@ -353,6 +459,12 @@ function Icon.ReleaseAll()
         end
     end
     texture_cache = {}
+    for _, entry in pairs(ui_texture_cache) do
+        if entry and entry.texture then
+            UiForge.ReleaseTexture(entry.texture)
+        end
+    end
+    ui_texture_cache = {}
 end
 
 return Icon

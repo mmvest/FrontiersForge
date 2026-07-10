@@ -12,6 +12,8 @@ local Group = require("frontiers_forge.group")              -- Access group info
 local Combat = require("frontiers_forge.combat")             -- Combat event hook (damage/heal capture)
 local QuestLog = require("frontiers_forge.quest_log")        -- Access the quest log
 local Icon = require("frontiers_forge.icon")                 -- Decode game icons into ImGui textures
+local Effects = require("frontiers_forge.effects")           -- Player's active effects (buffs/debuffs)
+local Inventory = require("frontiers_forge.inventory")       -- Access inventory items
 
 local function NotInGameWarning()
     ImGui.Text("(not in game - load a character to see this section)")
@@ -160,16 +162,26 @@ local function DisplayUiFunctions()
 end
 
 local function DisplayEntityDetails(entity)
-    ImGui.Text("Name: " .. entity.name)
-    ImGui.Text("ID: " .. entity.id)
-    ImGui.Text("Level: " .. entity.level)
-    ImGui.Text("HP: " .. entity.percent_hp .. "%")
-    ImGui.Text(string.format("Coordinates: x = %.2f, y = %.2f, z = %.2f", entity.x, entity.y, entity.z))
+    ImGui.Text("Name: " .. entity:GetName())
+    ImGui.Text("ID: " .. entity:GetId())
+    ImGui.Text("Level: " .. entity:GetLevel())
+    ImGui.Text("HP: " .. entity:GetHealthPercent() .. "%")
+    local x, y, z = entity:GetPosition()
+    ImGui.Text(string.format("Coordinates: x = %.2f, y = %.2f, z = %.2f", x, y, z))
+    local player_coords = Player.GetCoordinates()
+    ImGui.Text(string.format("Util.GetDistanceBetween(player, entity): %.2f", Util.GetDistanceBetween(player_coords, entity)))
+    ImGui.Text("IsValid: " .. tostring(entity:IsValid()))
 
     -- Disposition towards the player. The server only sends this
     -- for the CURRENT TARGET, so every other entity shows nil / "Unknown".
     ImGui.Text("Disposition: " .. tostring(entity.disposition)
         .. " (" .. tostring(entity.disposition_name) .. ")")
+    if entity.disposition ~= nil then
+        -- UI.DrawDispositionIcon draws the same face icon the game's target
+        -- nameplate uses for this disposition value.
+        ImGui.SameLine()
+        UI.DrawDispositionIcon(entity.disposition, 1.5)
+    end
 end
 
 local function DisplayPlayerFunctions()
@@ -226,24 +238,17 @@ end
 local function DisplayEntityListFunctions()
     if ImGui.CollapsingHeader("Entity List Functions") then
         local entity = EntityList.GetEntityById(Player.GetTargetEntityId())
-        if entity == nil then
-            entity = { id = 0, percent_hp = 0, x = 0, y = 0, z = 0, name = "No entity selected", level = 0,
-                       disposition = nil, disposition_name = EntityList.GetDispositionName(nil) }
-        end
-        if ImGui.TreeNode("GetEntityById: " .. entity.name .. " (ID: " .. entity.id .. ")") then
-            -- Inside the tree node, show the entity stats. The current target
-            -- is the one entity whose disposition is populated.
-            DisplayEntityDetails(entity)
+        if entity ~= nil then
+            if ImGui.TreeNode("GetEntityById: " .. entity.name .. " (ID: " .. entity.id .. ")") then
+                DisplayEntityDetails(entity)
 
-            -- End the tree node
-            ImGui.TreePop()
+                ImGui.TreePop()
+            end
+        else
+            ImGui.Text("GetEntityById: (no entity selected)")
         end
 
         entity = EntityList.GetEntityByIndex(0)
-        if entity == nil then
-            entity = { id = 0, percent_hp = 0, x = 0, y = 0, z = 0, name = "No entity", level = 0,
-                       disposition = nil, disposition_name = EntityList.GetDispositionName(nil) }
-        end
         if ImGui.TreeNode("GetEntityByIndex: " .. entity.name .. " (ID: " .. entity.id .. ")") then
             -- Inside the tree node, show the entity stats
             DisplayEntityDetails(entity)
@@ -253,10 +258,6 @@ local function DisplayEntityListFunctions()
         end
 
         local entities = EntityList.GetAllEntities()
-        if entities == nil then
-            entities = {{ id = 0, percent_hp = 0, x = 0, y = 0, z = 0, name = "No entities around", level = 0,
-                          disposition = nil, disposition_name = EntityList.GetDispositionName(nil) }}
-        end
         for index = 1, #entities do
             entity = entities[index]
             -- Display the tree node with the entity name and ID
@@ -342,16 +343,21 @@ local function DisplayAbilityDetails(ability)
     ImGui.Text("GetSpellbookSlot: " .. ability:GetSpellbookSlot())
     ImGui.Text("GetLevel: " .. ability:GetLevel())
     ImGui.Text(string.format("GetRange: %.2f", ability:GetRange()))
+    local range_target = EntityList.GetEntityById(Player.GetTargetEntityId())
+    if range_target == nil then
+        ImGui.Text("IsInRange: (nothing targeted)")
+    else
+        local in_range, distance = ability:IsInRange(Player.GetCoordinates(), range_target)
+        if in_range then
+            ImGui.TextColored(0.3, 1.0, 0.3, 1.0, string.format("IsInRange(player, target): true (distance %.2f)", distance))
+        else
+            ImGui.TextColored(1.0, 0.3, 0.3, 1.0, string.format("IsInRange(player, target): false (distance %.2f)", distance))
+        end
+    end
     ImGui.Text("GetCastTime: " .. ability:GetCastTime())
     ImGui.Text("GetPwrCost: " .. ability:GetPwrCost())
-    -- Icon refs are resource hashes. The hex form matches the res_<hash>.png
-    -- file names produced by tools/rip_esf_icons.py.
     ImGui.Text(string.format("GetIconBackgroundRef: %08X", ability:GetIconBackgroundRef()))
     ImGui.Text(string.format("GetIconForegroundRef: %08X", ability:GetIconForegroundRef()))
-
-    -- Icon.GetTexture(hash): decodes the icon straight out of game memory the
-    -- first time and returns a cached ImGui texture afterwards. Draw the
-    -- background first, then the foreground on top of it at the same spot.
     local bg_texture, bg_w, bg_h = Icon.GetTexture(ability:GetIconBackgroundRef())
     local fg_texture, fg_w, fg_h = Icon.GetTexture(ability:GetIconForegroundRef())
     local icon_scale = 1.5
@@ -545,14 +551,42 @@ local function DisplayAbilityBarFunctions()
         -- ability bar. Each bar's live slot count can vary (bar 0: 5-9).
         ImGui.Text("AbilityBar.num_bars: " .. AbilityBar.num_bars)
 
+        -- The game tracks which bar is selected and, per bar, which slot its
+        -- cursor is on (the slot W/S move during gameplay).
+        ImGui.Text("AbilityBar.GetSelectedBarIndex(): " .. tostring(AbilityBar.GetSelectedBarIndex()))
+
         for bar_index = 0, AbilityBar.num_bars - 1 do
             local slot_count = AbilityBar.GetSlotCount(bar_index)
             if ImGui.TreeNode("Bar " .. bar_index .. " - AbilityBar.GetSlotCount(" .. bar_index .. "): " .. slot_count) then
+                ImGui.Text("AbilityBar.GetSelectedSlotIndex(" .. bar_index .. "): "
+                    .. tostring(AbilityBar.GetSelectedSlotIndex(bar_index)))
                 for slot_index = 0, slot_count - 1 do
                     local ability_slot = AbilityBar.GetAbilitySlot(bar_index, slot_index)
                     if ImGui.TreeNode("AbilityBar.GetAbilitySlot(" .. bar_index .. ", " .. slot_index .. ")") then
                         ImGui.Text("AbilitySlot:IsEmpty(): " .. tostring(ability_slot:IsEmpty()))
                         ImGui.Text("AbilitySlot:GetIconRef(): " .. tostring(ability_slot:GetIconRef()))
+
+                        -- Ability slots carry a texture dictionary hash in their icon
+                        -- ref, and the item hotbar slots do not. They instead have
+                        -- hardcoded textures for them.
+                        if not ability_slot:IsEmpty() then
+                            local icon_texture, icon_w, icon_h
+                            local icon_ref = ability_slot:GetIconRef()
+                            if icon_ref ~= -1 then
+                                icon_texture, icon_w, icon_h = Icon.GetTexture(icon_ref)
+                            else
+                                local tex_id = AbilityBar.GetSlotUITexId(slot_index)
+                                ImGui.Text("AbilityBar.GetSlotUITexId(" .. slot_index .. "): " .. tostring(tex_id))
+                                icon_texture, icon_w, icon_h = Icon.GetUITexture(tex_id)
+                            end
+                            if icon_texture then
+                                ImGui.Text("Slot icon:")
+                                ImGui.SameLine()
+                                ImGui.Image(icon_texture, icon_w * 1.5, icon_h * 1.5)
+                            else
+                                ImGui.Text("Slot icon: (unavailable)")
+                            end
+                        end
                         -- GetAbilityIndex() returns nil when the slot doesn't
                         -- reference the player's ability list (empty slot or
                         -- other source type)
@@ -574,6 +608,60 @@ local function DisplayAbilityBarFunctions()
                     end
                 end
                 ImGui.TreePop()
+            end
+        end
+    end
+end
+
+local function DisplayEffectsFunctions()
+    if ImGui.CollapsingHeader("Effects Functions (buffs/debuffs)") then
+        if Util.IsInGame() == 0 then
+            NotInGameWarning()
+            return
+        end
+
+        -- Effects mirrors the icon row right of the health/power/exp bars
+        -- (also listed on the pause menu status page). Max 8 entries.
+        ImGui.Text("Effects.GetCount(): " .. Effects.GetCount() .. " / " .. Effects.max_effects)
+
+        -- Effects.All() iterates { index, icon_ref, name }; GetIconRef/GetName/
+        -- GetEffect also work for direct access.
+        for index, effect in Effects.All() do
+            local texture, w, h = Icon.GetTexture(effect.icon_ref, {trim_transparent=true})
+            if texture then
+                ImGui.Image(texture, w * 1.5, h * 1.5)
+                ImGui.SameLine()
+            end
+            ImGui.Text(index .. ". " .. tostring(effect.name)
+                .. string.format(" (icon %08X)", effect.icon_ref))
+        end
+    end
+end
+
+local function DisplayInventoryFunctions()
+    if ImGui.CollapsingHeader("Inventory Functions") then
+        if Util.IsInGame() == 0 then
+            NotInGameWarning()
+            return
+        end
+
+        ImGui.Text("Inventory.GetTunar(): " .. Inventory.GetTunar())
+        ImGui.Text("Inventory.SlotsUsed(): " .. Inventory.SlotsUsed())
+        ImGui.Text("Inventory.SlotsRemaining(): " .. Inventory.SlotsRemaining())
+
+        for _, item in ipairs(Inventory.GetItems()) do
+            local texture, w, h = Icon.GetTexture(item:GetIconRef(), {trim_transparent=true})
+            if texture then
+                ImGui.Image(texture, w * 1.5, h * 1.5)
+                ImGui.SameLine()
+            end
+            ImGui.Text(item.idx .. ". " .. item.name
+                .. " x" .. item.amount
+                .. " (" .. item.equipped_status .. ")"
+                .. string.format(" (icon %08X)", item.icon_ref))
+            local description = item:GetDescription()
+            if description ~= "" and ImGui.IsItemHovered() then
+                ImGui.SetTooltip(description)
             end
         end
     end
@@ -784,8 +872,183 @@ local function DisplayCombatFunctions()
     end
 end
 
+-- Custom chat window demo: catch Enter before the game sees it, focus our own ImGui
+-- text box instead of EQOA's typing window, let ImGui handle all of the text editing
+-- (the UiForge overlay does not pass keyboard input down to the game while an ImGui
+-- widget has focus), and on submit push the message out through the game's own send
+-- path with Chat.SendMessage.
+--
+-- Two hooks make this work:
+--   * Input.InstallKeyHook() lets us observe keys (Input.PollKeyEvents) and suppress
+--     specific ones (Input.SetKeySuppressed) so the game never sees them. Here only
+--     Enter is suppressed — it would otherwise open EQOA's built-in message box.
+--   * Chat.InstallSendHook() lets Chat.SendMessage hand the message to the game's own
+--     chat sender on the next frame, so the outbound packet is exactly what typing in
+--     the native chat window would produce.
+ff_custom_chat = ff_custom_chat or {
+    capturing = false,          -- key hook installed and Enter owned by us
+    box_active = false,         -- our ImGui chat box is open
+    focus_pending = false,      -- give the box keyboard focus on the next drawn frame
+    text = "",                  -- message being composed (owned by ImGui)
+    mode_index = 0,             -- selected entry of chat_modes below
+    last_sent = "(nothing sent yet)",
+    last_error = nil,
+}
+
+-- Selectable chat modes. Prefixing per send is how the game itself routes slash
+-- commands; there is no persistent mode to set (see Chat.ChatMode).
+local chat_modes = {
+    { name = "Default", prefix = Chat.ChatMode.Default },
+    { name = "Say",     prefix = Chat.ChatMode.Say },
+    { name = "Group",   prefix = Chat.ChatMode.Group },
+    { name = "Guild",   prefix = Chat.ChatMode.Guild },
+    { name = "Shout",   prefix = Chat.ChatMode.Shout },
+}
+
+local function SendCustomChatText()
+    local text = ff_custom_chat.text
+    if text == "" then
+        return
+    end
+    -- The text goes through the game's own typed-chat processor, so slash commands
+    -- typed into the box work exactly as they would in the native chat box
+    -- (/say /shout /tell /reply ...) and always override the selected mode.
+    local mode = chat_modes[ff_custom_chat.mode_index + 1].prefix
+    local ok, err = Chat.SendChatText(text, mode)
+    if ok then
+        ff_custom_chat.last_sent = text
+        ff_custom_chat.last_error = nil
+        ff_custom_chat.text = ""
+    else
+        ff_custom_chat.last_error = err
+    end
+end
+
+-- Runs every frame while capturing so the key ring buffer never overruns, even when
+-- the header is collapsed. The only key we act on is Enter: it opens our chat box and
+-- moves keyboard focus to it. Everything after that is ImGui's job.
+local function UpdateCustomChatCapture()
+    if not ff_custom_chat.capturing or not Input.IsKeyHookInstalled() then
+        return
+    end
+
+    for _, event in ipairs(Input.PollKeyEvents()) do
+        if event.is_down and event.key == Input.Key.Enter and not ff_custom_chat.box_active then
+            ff_custom_chat.box_active = true
+            ff_custom_chat.focus_pending = true
+        end
+    end
+end
+
+local function StartCapturing()
+    -- Both hooks are needed: one to grab keys, one to send.
+    local ok, err = Input.InstallKeyHook()
+    if not ok then
+        ff_custom_chat.last_error = err
+        return
+    end
+    ok, err = Chat.InstallSendHook()
+    if not ok then
+        ff_custom_chat.last_error = err
+        return
+    end
+
+    -- Swallow Enter so the game's own typing window never opens.
+    Input.SetKeySuppressed(Input.Key.Enter, true)
+    ff_custom_chat.capturing = true
+    ff_custom_chat.last_error = nil
+end
+
+local function StopCapturing()
+    -- Give the keyboard back to the game entirely: unsuppress Enter, then remove both
+    -- hooks so the patched instructions are restored and the caves zeroed.
+    if Input.IsKeyHookInstalled() then
+        Input.SetKeySuppressed(Input.Key.Enter, false)
+    end
+    Input.UninstallKeyHook()
+    Chat.UninstallSendHook()
+    ff_custom_chat.capturing = false
+    ff_custom_chat.box_active = false
+    ff_custom_chat.focus_pending = false
+end
+
+local function DisplayCustomChatInput()
+    if ImGui.CollapsingHeader("Custom Chat Input (keyboard intercept + send)") then
+        if Util.IsInGame() == 0 then
+            NotInGameWarning()
+            return
+        end
+
+        ImGui.Text("Capturing keyboard: " .. tostring(ff_custom_chat.capturing))
+        ImGui.Text("Key hook installed: " .. tostring(Input.IsKeyHookInstalled()))
+        ImGui.Text("Send hook installed: " .. tostring(Chat.IsSendHookInstalled()))
+
+        if not ff_custom_chat.capturing then
+            if ImGui.Button("Start capturing (suppress Enter)") then
+                StartCapturing()
+            end
+        else
+            if ImGui.Button("Stop capturing") then
+                StopCapturing()
+            end
+        end
+
+        if ff_custom_chat.last_error then
+            ImGui.Text("error: " .. ff_custom_chat.last_error)
+        end
+        if Chat.IsSendPending() then
+            -- The cave clears this the same frame it hands the message to the game. If
+            -- this line ever sticks, the hooked per-frame call site is not executing.
+            ImGui.Text("send pending (waiting for the game to pick it up)...")
+        end
+
+        -- Chat mode: applied as a slash-command prefix on each send. Typing an explicit
+        -- /command in the message box overrides it.
+        for i, m in ipairs(chat_modes) do
+            if i > 1 then ImGui.SameLine() end
+            ff_custom_chat.mode_index = ImGui.RadioButton(m.name, ff_custom_chat.mode_index, i - 1)
+        end
+
+        if not ff_custom_chat.box_active then
+            ImGui.Text("Press Enter in game to open the chat box (capturing must be on).")
+        else
+            if ff_custom_chat.focus_pending then
+                ImGui.SetKeyboardFocusHere()
+                ff_custom_chat.focus_pending = false
+            end
+            local entered
+            ff_custom_chat.text, entered = ImGui.InputText("message",
+                ff_custom_chat.text, ImGuiInputTextFlags.EnterReturnsTrue)
+            if entered then
+                SendCustomChatText()
+                ff_custom_chat.box_active = false
+            end
+            ImGui.SameLine()
+            if ImGui.Button("Cancel") then
+                ff_custom_chat.text = ""
+                ff_custom_chat.box_active = false
+            end
+        end
+
+        ImGui.Text("Last sent: " .. ff_custom_chat.last_sent)
+
+        ImGui.TextWrapped("Tip: capture keeps working with the header collapsed, but the chat box itself can only appear while this section is visible. Use Stop capturing to hand Enter back to the game.")
+    end
+end
+
+local function RemoveChatHooks()
+    StopCapturing()
+end
+
+if not ff_custom_chat.cleanup_registered then
+    UiForge.RegisterCallback(UiForge.CallbackType.DisableScript, RemoveChatHooks)
+    UiForge.RegisterCallback(UiForge.CallbackType.OnEject, RemoveChatHooks)
+    ff_custom_chat.cleanup_registered = true
+end
+
 -- Per-frame state updates that must run regardless of any UI visibility.
 UpdateCooldownTracking()
+UpdateCustomChatCapture()
 
 -- Begin a new ImGui window
 if ImGui.Begin("Frontiers Forge Test Window") then
@@ -810,11 +1073,17 @@ if ImGui.Begin("Frontiers Forge Test Window") then
 
     DisplayCooldownWatch()
 
+    DisplayEffectsFunctions()
+
+    DisplayInventoryFunctions()
+
     DisplayQuestLogFunctions()
 
     DisplayGroupFunctions()
 
     DisplayCombatFunctions()
+
+    DisplayCustomChatInput()
 
     DisplaySaveLoadFunctions()
 end

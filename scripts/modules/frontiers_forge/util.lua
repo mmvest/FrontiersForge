@@ -83,6 +83,19 @@ function Util.EEmem()
     return ee_mem
 end
 
+--- Size of EE main RAM. Offsets at or beyond this are not backed by guest memory,
+--- and dereferencing EEmem + offset for them reads unrelated (or unmapped) host memory.
+--- In short... trying to read past this will blow up eqoa.
+Util.EE_RAM_SIZE = 0x02000000
+
+--- Whether a u32 read from guest memory is a plausible pointer into EE RAM.
+--- Null and anything outside main RAM are rejected.
+--- @param ptr integer Value to validate.
+--- @return boolean valid True when ptr is safe to dereference as an EE address.
+function Util.IsValidEEPointer(ptr)
+    return ptr ~= nil and ptr > 0 and ptr < Util.EE_RAM_SIZE
+end
+
 --- Reads a value of the given ctype from EEmem plus offset.
 --- @param offset integer Offset from EEmem to read from.
 --- @param ctype string The ctype to read (e.g. "uint32_t").
@@ -116,19 +129,25 @@ end
 --   We return 0026CE38
 -- base_offset in this case is 0x4FA500
 -- steps is { 0x25C, 0x684, 0x1F8 }
---- If any pointer in the chain reads as null, we return nil rather than chasing
---- a bogus address.
+--- If any value in the chain is not a plausible EE pointer we return nil rather than
+--- chasing a bogus address. Every read here lands at EEmem + value on the host side,
+--- so a garbage u32 (e.g. non-pointer data read through a stale anchor) would become
+--- an out-of-bounds host read of up to 4GB past the 32MB of EE RAM and crash the
+--- emulator process. Bounding each hop to EE RAM makes that impossible.
 --- @param base_offset integer Base offset from EEMem to start traversal from.
 --- @param steps integer[] Ordered pointer-chain step values to add between reads.
---- @return integer|nil target_offset Final resolved offset, or nil if the chain hit a null pointer.
+--- @return integer|nil target_offset Final resolved offset, or nil if the chain hit a null or out-of-range pointer.
 function Util.GetOffsetFromPointerChain(base_offset, steps)
     local target_offset = base_offset
     for idx, step in ipairs(steps) do
         local ptr = Util.ReadFromOffset(target_offset, "uint32_t")
-        if ptr == 0 then
+        if not Util.IsValidEEPointer(ptr) then
             return nil
         end
         target_offset = ptr + step
+        if target_offset < 0 or target_offset >= Util.EE_RAM_SIZE then
+            return nil
+        end
     end
 
     return target_offset
@@ -219,6 +238,17 @@ end
 --- @return integer|nil exp Experience required, or nil for levels outside the table.
 function Util.GetExpRequiredForLevel(level)
     return exp_for_levels[level]
+end
+
+--- Straight line 3D distance between two world points.
+--- @param point_a table Point with x, y, and z fields.
+--- @param point_b table Point with x, y, and z fields.
+--- @return number distance
+function Util.GetDistanceBetween(point_a, point_b)
+    local dx = point_a.x - point_b.x
+    local dy = point_a.y - point_b.y
+    local dz = point_a.z - point_b.z
+    return math.sqrt(dx * dx + dy * dy + dz * dz)
 end
 
 --- Tests whether the bits selected by mask are all zero in value.
