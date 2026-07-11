@@ -172,4 +172,73 @@ function Player.GetTargetEntityId()
     return Util.ReadFromOffset(current_target_offset, "uint32_t")
 end
 
+--- The player's pet entity id, or nil when the player has no pet.
+--- The game clears the slot to -1 when the pet goes away.
+--- @return integer|nil pet_entity_id
+function Player.GetPetEntityId()
+    local pet_id = Util.ReadFromOffset(0x1FDB580, "int32_t")
+    if pet_id == nil or pet_id <= 0 then
+        return nil
+    end
+    return pet_id
+end
+
+-- Class and race ids index the game's own tables, which is where these names
+-- come from.
+Player.classes = {
+    [0] = "Warrior",
+    [1] = "Ranger",
+    [2] = "Paladin",
+    [3] = "Shadowknight",
+    [4] = "Monk",
+    [5] = "Bard",
+    [6] = "Rogue",
+    [7] = "Druid",
+    [8] = "Shaman",
+    [9] = "Cleric",
+    [10] = "Magician",
+    [11] = "Necromancer",
+    [12] = "Enchanter",
+    [13] = "Wizard",
+    [14] = "Alchemist",
+}
+
+Player.races = {
+    [0] = "Human",
+    [1] = "Elf",
+    [2] = "Dark Elf",
+    [3] = "Gnome",
+    [4] = "Dwarf",
+    [5] = "Troll",
+    [6] = "Barbarian",
+    [7] = "Halfling",
+    [8] = "Erudite",
+    [9] = "Ogre",
+}
+
+Player.max_class_id = 14
+Player.max_race_id = 9
+
+--- The player's class id. The game clamps anything above max_class_id to 0.
+--- @return integer class_id Class id from 0 to 14.
+function Player.GetClassId()
+    return Util.ReadFromOffset(player_offset + 0x1C, "uint32_t")
+end
+
+--- The player's race id. The game clamps anything above max_race_id to 0.
+--- @return integer race_id Race id from 0 to 9.
+function Player.GetRaceId()
+    return Util.ReadFromOffset(player_offset + 0x20, "uint32_t")
+end
+
+--- @return string|nil class_name Class name, or nil when the id is out of range.
+function Player.GetClassName()
+    return Player.classes[Player.GetClassId()]
+end
+
+--- @return string|nil race_name Race name, or nil when the id is out of range.
+function Player.GetRaceName()
+    return Player.races[Player.GetRaceId()]
+end
+
 return Player

@@ -1,69 +1,118 @@
-local UI = require("frontiers_forge.ui")                    -- Access UI elements
-local Player = require("frontiers_forge.player")            -- Access Player attributes and functions
-local Util = require("frontiers_forge.util")                -- Access Utility functions
-local EntityList = require("frontiers_forge.entity_list")   -- Access EntityList functions
+--[[
+mini_map.lua
+
+A live top-down minimap rendered from the game's own world geometry, walked out
+of EE memory, so it always matches the world, zone, or dungeon the player is in.
+
+Textured mode samples the real world textures through the meshes' UVs, so a
+town shows its roofs and streets from above. Flat mode drops the textures and
+shades purely by height, which reads better for caves and open terrain.
+
+The map is height aware in both modes. Geometry that starts above the ceiling
+cut is removed, so walking into a cave or dungeon renders the cave floor and
+walls around you instead of the roof above. The cut can follow the player
+automatically, dropping just under a real ceiling indoors and lifting out of the
+way under open sky.
+
+The map texture is rebuilt incrementally (a few thousand triangles per frame)
+whenever the player moves far enough, changes altitude, or zooms. Entities and
+the player arrow are drawn as an overlay on top of the texture, with an optional
+tracking layer that highlights, pings, and draws lines to named entities kept in
+.entl list files.
+]]
+
+local bit           = require("bit")
+local UI            = require("frontiers_forge.ui")
+local Player        = require("frontiers_forge.player")
+local Util          = require("frontiers_forge.util")
+local EntityList    = require("frontiers_forge.entity_list")
+local WorldGeometry = require("frontiers_forge.world_geometry")
+local MapRender     = require("frontiers_forge.map_render")
+
+-- The cut height used under open sky. Nothing in the world reaches this, so the
+-- whole scene, mountain tops included, survives the cut.
+local OPEN_SKY_CUT = 1e9
 
 mini_map_state = mini_map_state or {
-    window_flags                = ImGuiWindowFlags.AlwaysAutoResize + ImGuiWindowFlags.NoBackground + ImGuiWindowFlags.NoTitleBar,
-    initialized                 = false,
-    settings_registered         = false,
+    initialized         = false,
+    settings_registered = false,
 
-    -- Textures
-    map_texture                         = nil,
-    player_indicator_border_texture     = nil,
-    player_indicator_fill_texture       = nil,
-    
-    -- Constants
-    world_width         = 28000,
-    world_height        = 34000,
-    map_texture_width   = 14784,
-    map_texture_height  = 17952,
-    mini_map_width      = 150,
-    mini_map_height     = 150,
+    window_flags = ImGuiWindowFlags.AlwaysAutoResize + ImGuiWindowFlags.NoBackground + ImGuiWindowFlags.NoTitleBar,
 
+    -- Render mode: true samples the world's real textures, false shades by height
+    textured        = true,
 
-    default_uv1                     = ImVec2.new(0,0),
-    default_uv2                     = ImVec2.new(1,1),
-    default_texture_border_color    = ImVec4.new(0,0,0,0),
+    -- The world's baked vertex lighting follows the time of day, so leaving it
+    -- on renders most of the map black at night. Off shows the art unlit.
+    world_lighting  = false,
+    brightness      = 1.0,
 
-    -- General Settings
-    disable_compass             = false,
-    disable_in_start_menu       = false,
+    -- View settings
+    view_size       = 220,      -- on-screen minimap size in pixels
+    view_radius     = 150,      -- world units shown from center to edge
+    min_radius      = 40,
+    max_radius      = 600,
+    rotate_with_player = false,
 
-    -- Map Settings
-    map_scale                   = 1,
-    map_zoom                    = 1,
-    map_texture_offset_x        = 175,
-    map_texture_offset_y        = 145,
-    map_border_color            = {0, 0, 0, 1}, -- Black
-    map_border_thickness        = 1.0,
-    show_map_border             = true,
-    map_texture_tint            = {1, 1, 1, 1},
+    -- Zoom in on its own whenever the ceiling probe says we are inside, since
+    -- a room needs far less of the world on screen than a hillside does.
+    auto_zoom         = false,
+    indoor_view_radius = 60,
 
-    -- Player Indicator settings
-    player_indicator_width  = 24,
-    player_indicator_height = 24,
-    player_indicator_scale  = 1,
-    player_indicator_border_color   = {0, 0, 0, 1}, -- Black
-    show_player_indicator_border    = true,
-    player_indicator_fill_color     = {0, 1, 0, 1}, -- Green
-    show_player_indicator_fill      = true,
+    -- Height slicing and shading
+    auto_ceiling    = true,     -- find the ceiling instead of using ceiling_offset
+    ceiling_offset  = 20,       -- manual cut, geometry starting above player_y + this
+    ceiling_margin  = 3,        -- auto cut, how far under the found ceiling to cut
+    head_clearance  = 2,        -- auto cut, ignore geometry closer than this overhead
+    ceiling_search  = 250,      -- auto cut, stop looking this far overhead
+    floor_range     = 80,       -- shade falloff below the player
+    above_range     = 120,      -- shade falloff above the player
 
-    -- Entity Indicator settings
-    show_entities               = true,
-    entity_border_color         = {0, 0, 0, 1}, -- Black
-    entity_border_thickness     = 1,
-    show_entity_border          = true,
-    entity_radius               = 3,
-    entity_red_color            = 0xFF0000FF,
-    entity_yellow_color         = 0xFF00FFFF,
-    entity_white_color          = 0xFFFFFFFF,
-    entity_dark_blue_color      = 0xFF800000,
-    entity_light_blue_color     = 0xFFFF8080,
-    entity_green_color          = 0xFF00FF00,
-    entity_gray_color           = 0xFF808080,
+    -- Rebuild tuning
+    tex_size        = 512,
+    tris_per_frame  = 8000,
+    rebuild_move_frac = 0.35,   -- rebuild when player moved this fraction of build radius
+    rebuild_y_delta = 10,       -- rebuild when player altitude changed this much
+    rebuild_cut_delta = 5,      -- rebuild when the ceiling cut moved this much
 
-    -- Entity Tracking
+    -- Overlay settings
+    show_player     = true,
+    show_border     = true,
+    border_color    = {0, 0, 0, 1},
+    background_color = {0.05, 0.05, 0.08, 0.85},
+
+    -- The circular frame. The zoom and cut height buttons are round buttons
+    -- sitting on the rim, and each one can be dragged around it. Angles are in
+    -- screen degrees, 0 at the right and growing clockwise.
+    -- Defaults put the zoom pair together on the lower left and the cut pair
+    -- together on the lower right, either side of the clock.
+    circular         = true,
+    zoom_plus_angle  = 170,
+    zoom_minus_angle = 148,
+    cut_up_angle     = 10,
+    cut_down_angle   = 32,
+    cut_step         = 5,
+
+    -- A clock pinned to the bottom of the rim, showing the machine's local time.
+    show_clock       = true,
+    clock_24h        = false,
+
+    -- Entity indicator settings
+    show_entities           = true,
+    entity_radius           = 3,
+    entity_y_range          = 60,   -- hide entities more than this far above/below
+    show_entity_border      = true,
+    entity_border_color     = {0, 0, 0, 1},
+    entity_border_thickness = 1,
+    entity_red_color        = 0xFF0000FF,
+    entity_yellow_color     = 0xFF00FFFF,
+    entity_white_color      = 0xFFFFFFFF,
+    entity_dark_blue_color  = 0xFF800000,
+    entity_light_blue_color = 0xFFFF8080,
+    entity_green_color      = 0xFF00FF00,
+    entity_gray_color       = 0xFF808080,
+
+    -- Entity tracking
     entity_tracking_enabled     = false,
     ping_tracked_entities       = false,
     line_to_tracked_entities    = false,
@@ -77,48 +126,70 @@ mini_map_state = mini_map_state or {
     tracked_entities_file_name_buffer = "minimap_tracked_entities.entl",
     tracked_entities_available_lists = {},
     tracked_entities_lists_status = "",
-    _tracked_entities_combo_was_open = false,
-    
+    tracked_entities_combo_was_open = false,
+
+    -- Flat mode colors (rgba tables)
+    terrain_low     = {0.10, 0.15, 0.25, 1},
+    terrain_mid     = {0.25, 0.55, 0.30, 1},
+    terrain_high    = {0.93, 0.91, 0.80, 1},
+    actor_tint      = {0.75, 0.55, 0.40, 1},
+
+    disable_compass = false,
+
+    -- Font for the map window (clock, rim buttons, tooltips). Default is
+    -- ImGui's built in font, which sizes through the window scale instead.
+    font_name = "Default",
+    font_size = 13,
+
+    -- Runtime (not saved)
+    ring_press_id   = nil,      -- rim button the mouse went down on
+    ring_press_deg  = nil,      -- where on the rim the press started
+    ring_drag_id    = nil,      -- rim button being dragged around the rim
+    texture         = nil,
+    built           = nil,      -- view params of the texture currently displayed
+    rebuild         = nil,      -- in-progress rebuild job
+    probe           = nil,      -- last auto ceiling probe
+    indoors         = false,    -- last ceiling probe found a roof overhead
+    debug_stats     = { tris = 0, cells = 0 },
 }
 
---[[
-Entity tracking system
+local state = mini_map_state
 
-The mini-map always renders "all nearby entities" from the game. Entity tracking is an *optional* layer on top that
-lets you highlight a small, user-managed list of entity names (e.g., "Grass Snake", "Hatchling", "Lionwere").
-
-- `tracked_entities` is the saved list (array) of entries the user is tracking. Each entry stores its display `name`,
-a normalized `key` (lowercased name + trimmed), an `enabled` flag, and optional per-entity colors.
-
-- `tracked_entities_by_key` is a fast lookup table: normalized name -> index in `tracked_entities`. This avoids scanning
-  the list every frame and prevents duplicates.
-
-- When tracking is enabled, each rendered entity name is normalized and looked up in `tracked_entities_by_key` to decide
-  whether it should be highlighted / pinged / have a line drawn to it.
-]]
-mini_map_state.entity_tracking_enabled  = mini_map_state.entity_tracking_enabled or false
-mini_map_state.ping_tracked_entities    = mini_map_state.ping_tracked_entities or false
-mini_map_state.line_to_tracked_entities = mini_map_state.line_to_tracked_entities or false
-mini_map_state.tracked_entity_input     = mini_map_state.tracked_entity_input or ""
-mini_map_state.tracked_entities         = mini_map_state.tracked_entities or {}
-mini_map_state.tracked_entities_by_key  = mini_map_state.tracked_entities_by_key or {}
-mini_map_state.tracked_entities_index_dirty = (mini_map_state.tracked_entities_index_dirty ~= false)
-mini_map_state.tracked_entities_loaded  = mini_map_state.tracked_entities_loaded or false
-mini_map_state.tracked_entities_status  = mini_map_state.tracked_entities_status or ""
-mini_map_state.tracked_entities_file_name = mini_map_state.tracked_entities_file_name or "minimap_tracked_entities.entl"
-mini_map_state.tracked_entities_file_name_buffer = mini_map_state.tracked_entities_file_name_buffer or mini_map_state.tracked_entities_file_name
-mini_map_state.tracked_entities_available_lists = mini_map_state.tracked_entities_available_lists or {}
-mini_map_state.tracked_entities_lists_status = mini_map_state.tracked_entities_lists_status or ""
-mini_map_state._tracked_entities_combo_was_open = mini_map_state._tracked_entities_combo_was_open or false
-
-local function ScaleVec2(width, height, scale)
-    return width * scale, height * scale
+-- Auto zoom swaps which radius is live rather than overwriting the outdoor one,
+-- so zooming inside a cave never loses the zoom you set out in the world.
+local function ViewRadius()
+    if state.auto_zoom and state.indoors then
+        return state.indoor_view_radius
+    end
+    return state.view_radius
 end
+
+local function SetViewRadius(radius)
+    radius = math.max(state.min_radius, math.min(state.max_radius, radius))
+    if state.auto_zoom and state.indoors then
+        state.indoor_view_radius = radius
+    else
+        state.view_radius = radius
+    end
+end
+
+-- ---------------------------------------------------------------------------
+-- Entity tracking
+--
+-- The map always draws every nearby entity. Tracking is an optional layer that
+-- highlights a user managed list of entity names (e.g. "Grass Snake"). Entries
+-- live in .entl files under resources\mini_map, one CSV row per entity, so a
+-- list can be shared or swapped without touching the script.
+--
+-- tracked_entities is the list itself. tracked_entities_by_key maps a
+-- normalized name to its index, so the render loop is a hash lookup per entity
+-- instead of a scan.
+-- ---------------------------------------------------------------------------
+
+local DEFAULT_LIST_FILE = "minimap_tracked_entities.entl"
 
 local function Trim(str)
     if str == nil then return "" end
-
-    -- Convert to string, then strip leading (^%s+) and trailing (%s+$) whitespace via gsub.
     return (tostring(str):gsub("^%s+", ""):gsub("%s+$", ""))
 end
 
@@ -127,27 +198,21 @@ local function NormalizeEntityName(name)
 end
 
 local function RebuildTrackedEntitiesIndex()
-    mini_map_state.tracked_entities_by_key = {}
-    
-    -- We want O(1) lookups from entity name to tracked entry while rendering (so we don't scan the list every frame).
-    -- We also normalize names (trim/lowercase) so " Goblin " and "goblin" point to the same tracked entry.
-    for tracked_list_index, entry in ipairs(mini_map_state.tracked_entities) do
+    state.tracked_entities_by_key = {}
+    for index, entry in ipairs(state.tracked_entities) do
         entry.name = Trim(entry.name)
         entry.key = NormalizeEntityName(entry.name)
-        mini_map_state.tracked_entities_by_key[entry.key] = tracked_list_index
+        state.tracked_entities_by_key[entry.key] = index
 
         if entry.enabled == nil then entry.enabled = true end
         if entry.fill_color == nil then entry.fill_color = {1, 1, 0, 1} end
         if entry.border_color == nil then entry.border_color = {1, 1, 1, 1} end
     end
-
-    mini_map_state.tracked_entities_index_dirty = false
+    state.tracked_entities_index_dirty = false
 end
 
--- We want to avoid rebuilding the tracked entities list every frame, so we check if
--- the tracked entities index is dirty. If it is, then we rebuild the index.
 local function EnsureTrackedEntitiesIndex()
-    if mini_map_state.tracked_entities_index_dirty == true then
+    if state.tracked_entities_index_dirty == true then
         RebuildTrackedEntitiesIndex()
     end
 end
@@ -155,11 +220,11 @@ end
 local function SanitizeFileName(file_name)
     file_name = Trim(file_name)
     if file_name == "" then
-        file_name = "minimap_tracked_entities.entl"
+        file_name = DEFAULT_LIST_FILE
     end
 
-    -- Avoid invalid Windows filename characters. This isn't a comprehensive solution...
-    -- just don't be dumb with file names
+    -- Avoid invalid Windows filename characters. This isn't a comprehensive
+    -- solution, just don't be dumb with file names.
     file_name = file_name:gsub("[\\\\/:%*%?\"<>|]", "_")
 
     local lower = file_name:lower()
@@ -176,8 +241,7 @@ local function SanitizeFileName(file_name)
 end
 
 local function GetTrackedEntitiesFilePath()
-    local file_name = SanitizeFileName(mini_map_state.tracked_entities_file_name)
-    return UiForge.resources_path .. "\\mini_map\\" .. file_name
+    return UiForge.resources_path .. "\\mini_map\\" .. SanitizeFileName(state.tracked_entities_file_name)
 end
 
 local function Clamp01(value)
@@ -196,10 +260,8 @@ end
 local function CsvEscapeField(value)
     value = tostring(value or "")
 
-    -- When saving to CSV we must quote fields that could break parsing:
-    -- - commas/newlines (they would look like separators/extra rows)
-    -- - quotes (they must be escaped as doubled quotes per CSV rules)
-    -- - leading/trailing spaces
+    -- Quote anything that would break parsing on the way back in: separators,
+    -- newlines, quotes (doubled per CSV rules), and edge whitespace.
     if value:find("[\",\n\r]") or value:find("^%s") or value:find("%s$") then
         value = value:gsub("\"", "\"\"")
         return "\"" .. value .. "\""
@@ -208,9 +270,6 @@ local function CsvEscapeField(value)
 end
 
 local function CsvParseLine(line)
-    -- Minimal CSV parser that:
-    -- - splits on commas, except when inside quotes
-    -- - supports escaped quotes ("") inside quoted fields
     local parsed_fields = {}
     local current_field = ""
     local is_in_quotes = false
@@ -221,7 +280,7 @@ local function CsvParseLine(line)
         local char = line:sub(position, position)
         if is_in_quotes then
             if char == "\"" then
-                -- If we see a doubled quote ("") while in quotes, that represents a literal quote character.
+                -- A doubled quote inside quotes is a literal quote character.
                 if position < line_length and line:sub(position + 1, position + 1) == "\"" then
                     current_field = current_field .. "\""
                     position = position + 1
@@ -255,12 +314,12 @@ local function AddTrackedEntity(name)
     if name == "" then return end
 
     local key = NormalizeEntityName(name)
-    if mini_map_state.tracked_entities_by_key[key] ~= nil then
-        mini_map_state.tracked_entities_status = "Already tracking: " .. name
+    if state.tracked_entities_by_key[key] ~= nil then
+        state.tracked_entities_status = "Already tracking: " .. name
         return
     end
 
-    mini_map_state.tracked_entities[#mini_map_state.tracked_entities + 1] = {
+    state.tracked_entities[#state.tracked_entities + 1] = {
         name = name,
         key = key,
         enabled = true,
@@ -268,64 +327,62 @@ local function AddTrackedEntity(name)
         border_color = {1, 1, 1, 1},
     }
 
-    mini_map_state.tracked_entities_index_dirty = true
     RebuildTrackedEntitiesIndex()
-    mini_map_state.tracked_entities_status = "Added: " .. name
+    state.tracked_entities_status = "Added: " .. name
 end
 
 local function RemoveTrackedEntityAtIndex(index)
-    table.remove(mini_map_state.tracked_entities, index)
-    mini_map_state.tracked_entities_index_dirty = true
+    table.remove(state.tracked_entities, index)
     RebuildTrackedEntitiesIndex()
 end
 
 local function ClearTrackedEntities()
-    mini_map_state.tracked_entities = {}
-    mini_map_state.tracked_entities_index_dirty = true
+    state.tracked_entities = {}
     RebuildTrackedEntitiesIndex()
-    mini_map_state.tracked_entities_status = "Cleared all tracked entities"
+    state.tracked_entities_status = "Cleared all tracked entities"
 end
 
--- Saves the current tracked entity list to an `.entl` file under `resources\\mini_map`.
+--- Saves the tracked entity list to its .entl file under resources\mini_map.
 local function SaveTrackedEntitiesToFile()
     EnsureTrackedEntitiesIndex()
 
     local path = GetTrackedEntitiesFilePath()
     local file = io.open(path, "w")
     if file == nil then
-        mini_map_state.tracked_entities_status = "Failed to write: " .. path
+        state.tracked_entities_status = "Failed to write: " .. path
         return false
     end
 
-    file:write("# minimap_tracked_entities.entl\n")
+    file:write("# " .. DEFAULT_LIST_FILE .. "\n")
     file:write("# One entity per line (CSV): name,enabled,fillR,fillG,fillB,fillA,borderR,borderG,borderB,borderA\n")
 
-    for _, entry in ipairs(mini_map_state.tracked_entities) do
+    for _, entry in ipairs(state.tracked_entities) do
         local parts = {
             CsvEscapeField(entry.name),
             (entry.enabled and "true" or "false"),
-            tostring(entry.fill_color[1]), tostring(entry.fill_color[2]), tostring(entry.fill_color[3]), tostring(entry.fill_color[4]),
-            tostring(entry.border_color[1]), tostring(entry.border_color[2]), tostring(entry.border_color[3]), tostring(entry.border_color[4]),
+            tostring(entry.fill_color[1]), tostring(entry.fill_color[2]),
+            tostring(entry.fill_color[3]), tostring(entry.fill_color[4]),
+            tostring(entry.border_color[1]), tostring(entry.border_color[2]),
+            tostring(entry.border_color[3]), tostring(entry.border_color[4]),
         }
         file:write(table.concat(parts, ","), "\n")
     end
 
     file:close()
-    mini_map_state.tracked_entities_status = "Saved: " .. path
+    state.tracked_entities_status = "Saved: " .. path
     return true
 end
 
--- Loads a tracked entity list from an `.entl` file under `resources\\mini_map`.
+--- Loads a tracked entity list from an .entl file under resources\mini_map.
 local function LoadTrackedEntitiesFromFile()
     local path = GetTrackedEntitiesFilePath()
     local file = io.open(path, "r")
     if file == nil then
-        mini_map_state.tracked_entities_status = "No tracked entities file found"
+        state.tracked_entities_status = "No tracked entities file found"
         return false
     end
 
     local loaded = {}
-
     for line in file:lines() do
         local trimmed = Trim(line)
         if trimmed ~= "" and not trimmed:match("^#") then
@@ -333,21 +390,21 @@ local function LoadTrackedEntitiesFromFile()
             if #fields >= 2 then
                 local name = Trim(fields[1])
                 if name ~= "" then
-                    local enabled = ParseBool(fields[2])
                     local fill = {1, 1, 0, 1}
                     local border = {1, 1, 1, 1}
 
                     if #fields >= 10 then
-                        local fr = Clamp01(fields[3]); local fg = Clamp01(fields[4]); local fb = Clamp01(fields[5]); local fa = Clamp01(fields[6])
-                        local br = Clamp01(fields[7]); local bg = Clamp01(fields[8]); local bb = Clamp01(fields[9]); local ba = Clamp01(fields[10])
-
+                        local fr, fg, fb, fa = Clamp01(fields[3]), Clamp01(fields[4]),
+                                               Clamp01(fields[5]), Clamp01(fields[6])
+                        local br, bg, bb, ba = Clamp01(fields[7]), Clamp01(fields[8]),
+                                               Clamp01(fields[9]), Clamp01(fields[10])
                         if fr and fg and fb and fa then fill = {fr, fg, fb, fa} end
                         if br and bg and bb and ba then border = {br, bg, bb, ba} end
                     end
 
                     loaded[#loaded + 1] = {
                         name = name,
-                        enabled = enabled,
+                        enabled = ParseBool(fields[2]),
                         fill_color = fill,
                         border_color = border,
                     }
@@ -355,41 +412,35 @@ local function LoadTrackedEntitiesFromFile()
             end
         end
     end
-
     file:close()
 
-    mini_map_state.tracked_entities = loaded
-    mini_map_state.tracked_entities_index_dirty = true
+    state.tracked_entities = loaded
     RebuildTrackedEntitiesIndex()
-    mini_map_state.tracked_entities_status = "Loaded: " .. path
+    state.tracked_entities_status = "Loaded: " .. path
     return true
 end
 
 local function TryLoadTrackedEntitiesOnce()
     EnsureTrackedEntitiesIndex()
-    if mini_map_state.tracked_entities_loaded == true then return end
+    if state.tracked_entities_loaded == true then return end
 
     LoadTrackedEntitiesFromFile()
-    mini_map_state.tracked_entities_loaded = true
+    state.tracked_entities_loaded = true
 end
 
 local function RefreshTrackedEntitiesAvailableLists()
     local dir = tostring(UiForge.resources_path) .. "\\mini_map"
 
-    local ok, lines_or_err = pcall(Util.ListFilesInDir, dir, "*.entl")
+    local ok, files = pcall(Util.ListFilesInDir, dir, "*.entl")
     if not ok then
-        mini_map_state.tracked_entities_lists_status = tostring(lines_or_err or "Unable to list .entl files")
-        mini_map_state.tracked_entities_available_lists = { SanitizeFileName(mini_map_state.tracked_entities_file_name) }
+        state.tracked_entities_lists_status = tostring(files or "Unable to list .entl files")
+        state.tracked_entities_available_lists = { SanitizeFileName(state.tracked_entities_file_name) }
         return
     end
 
-    local lines = lines_or_err or {}
-
-    local results = {}
-    local seen = {}
-
-    for _, line in ipairs(lines) do
-        local name = Trim(line)
+    local results, seen = {}, {}
+    for _, file_name in ipairs(files or {}) do
+        local name = Trim(file_name)
         if name ~= "" then
             local sanitized = SanitizeFileName(name)
             if not seen[sanitized] then
@@ -399,18 +450,18 @@ local function RefreshTrackedEntitiesAvailableLists()
         end
     end
 
-    local active = SanitizeFileName(mini_map_state.tracked_entities_file_name)
+    local active = SanitizeFileName(state.tracked_entities_file_name)
     if not seen[active] then
         results[#results + 1] = active
     end
 
     table.sort(results)
-    mini_map_state.tracked_entities_available_lists = results
-    mini_map_state.tracked_entities_lists_status = ""
+    state.tracked_entities_available_lists = results
+    state.tracked_entities_lists_status = ""
 end
 
 local function OpenSaveTrackedEntitiesAsPopup()
-    mini_map_state.tracked_entities_file_name_buffer = mini_map_state.tracked_entities_file_name
+    state.tracked_entities_file_name_buffer = state.tracked_entities_file_name
     ImGui.OpenPopup("Save Tracked Entities As")
 end
 
@@ -427,20 +478,20 @@ local function RenderSaveTrackedEntitiesAsPopup()
     ImGui.SameLine()
     ImGui.TextUnformatted(tostring(UiForge.resources_path) .. "\\mini_map\\")
 
-    local hint = "e.g. bosses.entl"
     local enter_returns_true_flag = (ImGuiInputTextFlags and ImGuiInputTextFlags.EnterReturnsTrue) or 0
-    local new_text, enter_pressed = ImGui.InputTextWithHint("File name", hint, mini_map_state.tracked_entities_file_name_buffer, enter_returns_true_flag)
+    local new_text, enter_pressed = ImGui.InputTextWithHint("File name", "e.g. bosses.entl",
+        state.tracked_entities_file_name_buffer, enter_returns_true_flag)
     if new_text ~= nil then
-        mini_map_state.tracked_entities_file_name_buffer = new_text
+        state.tracked_entities_file_name_buffer = new_text
     end
 
-    local sanitized = SanitizeFileName(mini_map_state.tracked_entities_file_name_buffer)
+    local sanitized = SanitizeFileName(state.tracked_entities_file_name_buffer)
     ImGui.TextDisabled("Will use:")
     ImGui.SameLine()
     ImGui.TextUnformatted(sanitized)
 
     if ImGui.Button("Save") or enter_pressed then
-        mini_map_state.tracked_entities_file_name = sanitized
+        state.tracked_entities_file_name = sanitized
         SaveTrackedEntitiesToFile()
 
         ImGui.CloseCurrentPopup()
@@ -450,7 +501,7 @@ local function RenderSaveTrackedEntitiesAsPopup()
 
     ImGui.SameLine()
     if ImGui.Button("Use Default") then
-        mini_map_state.tracked_entities_file_name_buffer = "minimap_tracked_entities.entl"
+        state.tracked_entities_file_name_buffer = DEFAULT_LIST_FILE
     end
 
     ImGui.SameLine()
@@ -463,556 +514,1013 @@ local function RenderSaveTrackedEntitiesAsPopup()
     ImGui.EndPopup()
 end
 
-local function ToggleCompass()
-    if mini_map_state.disable_compass == true then
-        UI.DisableCompass()
-        return
+-- ---------------------------------------------------------------------------
+-- Height slicing
+-- ---------------------------------------------------------------------------
+
+--- The height to cut the world at this frame. In auto mode the geometry decides:
+--- a ceiling overhead means we are inside, so cut just below it and reveal the
+--- room, and open sky means cut nothing so mountains and rooftops survive.
+--- The probe walks room geometry, so its result is reused until the player has
+--- moved or enough time has passed for the scene to have streamed in.
+local function CeilingCut(px, py, pz)
+    if not state.auto_ceiling then
+        state.indoors = false
+        return py + state.ceiling_offset
     end
 
-    UI.EnableCompass()
-end
-
-local function DebugWindow()
-
-end
-
-local function DrawRotatedImage(texture, center, dimensions, angle_of_orientation, target_angle, tint)
-    -- Get the draw list from ImGui
-    local draw_list = ImGui.GetWindowDrawList()
-
-    -- Calculate the relative rotation needed
-    local rotation_angle = target_angle + angle_of_orientation
-
-    -- Calculate sine and cosine of the relative rotation angle
-    local cos_theta = math.cos(rotation_angle)
-    local sin_theta = math.sin(rotation_angle)
-
-    -- Half-width and half-height of the image
-    local half_width = dimensions.x * 0.5
-    local half_height = dimensions.y * 0.5
-
-    -- Define the four corners of the image before rotation
-    local corners = {
-        ImVec2.new(-half_width, -half_height), -- Top-left
-        ImVec2.new(half_width, -half_height),  -- Top-right
-        ImVec2.new(half_width, half_height),   -- Bottom-right
-        ImVec2.new(-half_width, half_height)  -- Bottom-left
-    }
-
-    -- Rotate each corner around the center
-    for i, corner in ipairs(corners) do
-        local rotated_x = corner.x * sin_theta - corner.y * cos_theta
-        local rotated_y = corner.x * cos_theta + corner.y * sin_theta
-        corners[i] = ImVec2.new(center.x + rotated_x, center.y + rotated_y)
+    local now = ImGui.GetTime()
+    local probe = state.probe
+    local stale = probe == nil
+    if not stale then
+        local dx, dz = px - probe.x, pz - probe.z
+        stale = dx * dx + dz * dz > 4
+             or math.abs(py - probe.y) > 2
+             or now - probe.time > 0.5
     end
 
-    -- Define UV coordinates for the image (static, as the image is not clipped here)
-    local uv0 = ImVec2.new(0.0, 0.0) -- Top-left UV
-    local uv1 = ImVec2.new(1.0, 0.0) -- Top-right UV
-    local uv2 = ImVec2.new(1.0, 1.0) -- Bottom-right UV
-    local uv3 = ImVec2.new(0.0, 1.0) -- Bottom-left UV
+    if stale then
+        local ceiling = WorldGeometry.CeilingAbove(px, py, pz, state.head_clearance,
+                                                   state.ceiling_search, 3)
+        probe = { x = px, y = py, z = pz, time = now, ceiling = ceiling }
+        state.probe = probe
+    end
 
-    -- Convert the tint color to ImGui's format
-    local image_tint = ImGui.GetColorU32(tint[1], tint[2], tint[3], tint[4])
-
-    -- Draw the image as a quad with rotation applied
-    draw_list:AddImageQuad(texture, corners[1], corners[2], corners[3], corners[4], uv0, uv1, uv2, uv3, image_tint)
+    state.indoors = probe.ceiling ~= nil
+    if probe.ceiling == nil then
+        return py + OPEN_SKY_CUT
+    end
+    return probe.ceiling - state.ceiling_margin
 end
 
-local function Initialize()
-    if mini_map_state.map_texture == nil then mini_map_state.map_texture = UiForge.IGraphicsApi.CreateTextureFromFile(UiForge.resources_path .. "\\mini_map\\tunaria.jpg") end
-    
-    -- Original indicator image from https://cdn0.iconfinder.com/data/icons/maps-navigation-filled-line/614/3719_-_Pointer_I-512.png
-    if mini_map_state.player_indicator_border_texture == nil then mini_map_state.player_indicator_border_texture = UiForge.IGraphicsApi.CreateTextureFromFile(UiForge.resources_path .. "\\mini_map\\player_indicator_border.png") end
-    if mini_map_state.player_indicator_fill_texture == nil then mini_map_state.player_indicator_fill_texture = UiForge.IGraphicsApi.CreateTextureFromFile(UiForge.resources_path .. "\\mini_map\\player_indicator_fill.png") end
-    ToggleCompass()
+-- ---------------------------------------------------------------------------
+-- Incremental texture rebuild
+-- ---------------------------------------------------------------------------
 
-    -- If we have a saved tracked entity file, try to load it
+local function StartRebuild(px, py, pz, cut_y)
+    local build_radius = ViewRadius() * 1.5
+    local job = MapRender.Start({
+        center_x = px, center_z = pz,
+        radius = build_radius,
+        size = state.tex_size,
+        ref_y = py,
+        cut_y = cut_y,
+        floor_range = state.floor_range,
+        above_range = state.above_range,
+        textured = state.textured,
+        lighting = state.world_lighting,
+        brightness = state.brightness,
+        colors = {
+            low = state.terrain_low,
+            mid = state.terrain_mid,
+            high = state.terrain_high,
+            actor_tint = state.actor_tint,
+            background = state.background_color,
+        },
+    })
+    WorldGeometry.EachRoomInRadius(px, pz, build_radius, function(room)
+        job.cells[#job.cells + 1] = room
+    end)
+    state.rebuild = job
+end
+
+local function StepRebuild()
+    local job = state.rebuild
+    if job == nil then return end
+    if MapRender.Step(job, state.tris_per_frame) then
+        local new_texture = MapRender.Upload(job)
+        if state.texture ~= nil then
+            UiForge.ReleaseTexture(state.texture)
+        end
+        state.texture = new_texture
+        state.built = {
+            center_x = job.center_x, center_z = job.center_z,
+            player_y = job.ref_y,
+            cut_y = job.cut_y,
+            radius = job.radius, size = job.size,
+            textured = job.textured,
+        }
+        state.debug_stats.tris = job.tris_done
+        state.debug_stats.cells = #job.cells
+        state.rebuild = nil
+    end
+end
+
+local function NeedsRebuild(px, py, pz, cut_y)
+    local built = state.built
+    if built == nil then return true end
+    if built.textured ~= state.textured then return true end
+    if math.abs(built.radius - ViewRadius() * 1.5) > 1 then return true end
+    local dx, dz = px - built.center_x, pz - built.center_z
+    local max_move = built.radius * state.rebuild_move_frac
+    if dx * dx + dz * dz > max_move * max_move then return true end
+    if math.abs(py - built.player_y) > state.rebuild_y_delta then return true end
+    if math.abs(cut_y - built.cut_y) > state.rebuild_cut_delta then return true end
+    return false
+end
+
+-- ---------------------------------------------------------------------------
+-- Rendering
+-- ---------------------------------------------------------------------------
+
+local function DrawMapTexture(draw_list, origin, view_px, px, pz, heading)
+    local built = state.built
+    if built == nil or state.texture == nil then return end
+
+    -- The texture covers a square of built.radius around built.center. Show
+    -- the view_radius window centered on the live player position so the map
+    -- pans smoothly between rebuilds.
+    local tex_world = built.radius * 2
+    local u_center = (px - (built.center_x - built.radius)) / tex_world
+    local v_center = (pz - (built.center_z - built.radius)) / tex_world
+    local half_uv = ViewRadius() / tex_world
+
+    local cx = origin.x + view_px * 0.5
+    local cy = origin.y + view_px * 0.5
+    local half = view_px * 0.5
+    local tint = ImGui.GetColorU32(1, 1, 1, 1)
+
+    if state.rotate_with_player then
+        local ang = heading
+        local cos_a, sin_a = math.cos(ang), math.sin(ang)
+        local function rot_uv(du, dv)
+            return ImVec2.new(u_center + (du * cos_a - dv * sin_a) * half_uv,
+                              v_center + (du * sin_a + dv * cos_a) * half_uv)
+        end
+        draw_list:AddImageQuad(state.texture,
+            ImVec2.new(cx - half, cy - half), ImVec2.new(cx + half, cy - half),
+            ImVec2.new(cx + half, cy + half), ImVec2.new(cx - half, cy + half),
+            rot_uv(-1, -1), rot_uv(1, -1), rot_uv(1, 1), rot_uv(-1, 1), tint)
+    elseif state.circular then
+        -- Rounding by half the size turns the image into a disc, which is the
+        -- whole circular frame. A rotated quad cannot be rounded, which is why
+        -- Rotate With Player falls back to the square above.
+        draw_list:AddImageRounded(state.texture,
+            ImVec2.new(cx - half, cy - half), ImVec2.new(cx + half, cy + half),
+            ImVec2.new(u_center - half_uv, v_center - half_uv),
+            ImVec2.new(u_center + half_uv, v_center + half_uv), tint, half)
+    else
+        draw_list:AddImage(state.texture,
+            ImVec2.new(cx - half, cy - half), ImVec2.new(cx + half, cy + half),
+            ImVec2.new(u_center - half_uv, v_center - half_uv),
+            ImVec2.new(u_center + half_uv, v_center + half_uv), tint)
+    end
+end
+
+local function WorldToScreen(wx, wz, px, pz, center, scale, heading)
+    local dx, dz = wx - px, wz - pz
+    if state.rotate_with_player then
+        local cos_a, sin_a = math.cos(-heading), math.sin(-heading)
+        dx, dz = dx * cos_a - dz * sin_a, dx * sin_a + dz * cos_a
+    end
+    return ImVec2.new(center.x + dx * scale, center.y + dz * scale)
+end
+
+local function EntityConColor(entity_level, player_level)
+    if     entity_level - 2 >  player_level then return state.entity_red_color
+    elseif entity_level - 1 >= player_level then return state.entity_yellow_color
+    elseif entity_level     == player_level then return state.entity_white_color
+    elseif entity_level + 1 == player_level then return state.entity_dark_blue_color
+    elseif entity_level + 2 == player_level then return state.entity_light_blue_color
+    elseif entity_level + 5 <= player_level then return state.entity_gray_color
+    else return state.entity_green_color end
+end
+
+-- The ping is a ring that expands and fades out of a tracked entity on a fixed
+-- cycle. Returns the phase (0 to 1) and its color, or nil between pings.
+local function PingPulse()
+    if not (state.entity_tracking_enabled and state.ping_tracked_entities) then
+        return nil, nil
+    end
+    local ping_period = 1.5
+    local ping_duration = 0.35
+    local ping_t = ImGui.GetTime() % ping_period
+    if ping_t > ping_duration then return nil, nil end
+
+    local phase = ping_t / ping_duration
+    return phase, ImGui.GetColorU32(1, 1, 1, 1.0 - phase)
+end
+
+local function DrawEntities(draw_list, center, px, py, pz, scale, heading, view_px, origin)
+    EnsureTrackedEntitiesIndex()
+
+    local entities = EntityList.GetAllEntities()
+    local player_level = Player.GetLevel()
+    local default_border = ImGui.GetColorU32(state.entity_border_color[1],
+        state.entity_border_color[2], state.entity_border_color[3],
+        state.entity_border_color[4])
+    local line_color = ImGui.GetColorU32(1, 1, 1, 0.75)
+    local tracking = state.entity_tracking_enabled and state.tracked_entities_by_key ~= nil
+    local ping_phase, ping_color = PingPulse()
+
+    -- Slot 1 is always the player.
+    for i = 2, #entities do
+        local entity = entities[i]
+        local id = entity:GetId()
+        local name = entity:GetName()
+        -- Despawned slots transiently hold empty data, skip them.
+        if id ~= 0 and name ~= "" then
+            local ex, ey, ez = entity:GetPosition()
+            -- Entities on another floor of a dungeon are noise, fade them out
+            -- and skip them entirely once far above/below.
+            local dy = math.abs(ey - py)
+            if dy <= state.entity_y_range then
+                local p = WorldToScreen(ex, ez, px, pz, center, scale, heading)
+                -- On the disc an entity is visible inside the rim, on the square
+                -- inside the rect.
+                local visible
+                if state.circular and not state.rotate_with_player then
+                    local dcx, dcy = p.x - center.x, p.y - center.y
+                    local rim = view_px * 0.5 - state.entity_radius
+                    visible = dcx * dcx + dcy * dcy <= rim * rim
+                else
+                    visible = p.x >= origin.x and p.x <= origin.x + view_px
+                        and p.y >= origin.y and p.y <= origin.y + view_px
+                end
+                if visible then
+                    local level = entity:GetLevel()
+                    local fill = EntityConColor(level, player_level)
+                    local border = default_border
+
+                    local is_tracked = false
+                    if tracking then
+                        local index = state.tracked_entities_by_key[NormalizeEntityName(name)]
+                        local entry = index and state.tracked_entities[index] or nil
+                        if entry ~= nil and entry.enabled ~= false then
+                            is_tracked = true
+                            fill = ImGui.GetColorU32(entry.fill_color[1], entry.fill_color[2],
+                                                     entry.fill_color[3], entry.fill_color[4])
+                            border = ImGui.GetColorU32(entry.border_color[1], entry.border_color[2],
+                                                       entry.border_color[3], entry.border_color[4])
+                        end
+                    end
+
+                    if not is_tracked and dy > state.entity_y_range * 0.5 then
+                        fill = bit.band(fill, 0x60FFFFFF)
+                    end
+
+                    if is_tracked and state.line_to_tracked_entities then
+                        draw_list:AddLine(center, p, line_color, 1.0)
+                    end
+
+                    draw_list:AddCircleFilled(p, state.entity_radius, fill)
+
+                    if state.show_entity_border or is_tracked then
+                        draw_list:AddCircle(p, state.entity_radius, border, 0,
+                                            state.entity_border_thickness)
+                    end
+
+                    if is_tracked and ping_color ~= nil then
+                        local ping_radius = state.entity_radius + 4 + (ping_phase * 18)
+                        draw_list:AddCircle(p, ping_radius, ping_color, 0, 2.0)
+                    end
+
+                    local mx, my = ImGui.GetMousePos()
+                    local dsq = (mx - p.x) ^ 2 + (my - p.y) ^ 2
+                    if dsq <= state.entity_radius ^ 2 then
+                        ImGui.BeginTooltip()
+                        -- Entity names are untrusted, render them unformatted.
+                        ImGui.TextUnformatted(string.format("%s (%d)\nID: %d\n%.1f, %.1f, %.1f",
+                            name, level, id, ex, ey, ez))
+                        ImGui.EndTooltip()
+                    end
+                end
+            end
+        end
+    end
+end
+
+local function DrawPlayerArrow(draw_list, center, heading)
+    -- Compass heading increases opposite to screen-space rotation, negate it.
+    local ang = state.rotate_with_player and 0 or -heading
+    local size = 7
+    local cos_a, sin_a = math.cos(ang), math.sin(ang)
+    local function pt(dx, dz)
+        return ImVec2.new(center.x + (dx * cos_a - dz * sin_a),
+                          center.y + (dx * sin_a + dz * cos_a))
+    end
+    local tip   = pt(0, -size * 1.4)
+    local left  = pt(-size * 0.7, size)
+    local right = pt(size * 0.7, size)
+    draw_list:AddTriangleFilled(tip, left, right, ImGui.GetColorU32(0.2, 1, 0.2, 1))
+    draw_list:AddTriangle(tip, left, right, ImGui.GetColorU32(0, 0, 0, 1), 1.5)
+end
+
+-- Explains the control that was just drawn, on hover.
+local function Tooltip(text)
+    if not ImGui.IsItemHovered() then return end
+    ImGui.BeginTooltip()
+    ImGui.TextUnformatted(text)
+    ImGui.EndTooltip()
+end
+
+-- Shortest angular distance between two screen angles, in degrees.
+local function AngularDiff(a, b)
+    return math.abs(((a - b + 180) % 360) - 180)
+end
+
+-- Keeps a rim button off the clock's stretch of the rim, snapping to whichever
+-- edge of the reserved arc is closer.
+local function ClampRingAngle(deg)
+    deg = deg % 360
+    if not state.show_clock then
+        return deg
+    end
+    local reserve = 34
+    if AngularDiff(deg, 90) < reserve then
+        local off = ((deg - 90 + 180) % 360) - 180
+        deg = (off < 0) and (90 - reserve) or (90 + reserve)
+    end
+    return deg % 360
+end
+
+--- Moves the height cut by one step. Which knob that turns depends on the mode,
+--- auto cutting indoors moves the margin under the found ceiling, manual moves
+--- the fixed offset. Outdoors under auto there is no cut to move.
+local function AdjustCutHeight(direction)
+    local step = state.cut_step * direction
+    if state.auto_ceiling then
+        if state.indoors then
+            -- Raising the cut means cutting closer to the ceiling.
+            state.ceiling_margin = math.max(0, math.min(60, state.ceiling_margin - step))
+            state.built = nil
+        end
+    else
+        state.ceiling_offset = math.max(0, math.min(600, state.ceiling_offset + step))
+        state.built = nil
+    end
+end
+
+local function CutTooltip(direction)
+    if state.auto_ceiling and not state.indoors then
+        return "Cut height (open sky, nothing overhead to cut)"
+    end
+    local what = state.auto_ceiling and "auto indoor cut" or "cut height"
+    return string.format("%s the %s by %d\nDrag to move this button around the rim",
+        direction > 0 and "Raise" or "Lower", what, state.cut_step)
+end
+
+-- A round button pinned to the rim of the circular map. A click fires it, and
+-- dragging slides it around the rim instead. The invisible button underneath is
+-- what keeps a drag from moving the whole window.
+local function RingButton(draw_list, id, label, center, rim_radius, angle_key, tooltip)
+    local btn_r = 10
+    local ang = math.rad(state[angle_key])
+    local bx = center.x + math.cos(ang) * rim_radius
+    local by = center.y + math.sin(ang) * rim_radius
+
+    ImGui.SetCursorScreenPos(bx - btn_r, by - btn_r)
+    local pressed = ImGui.InvisibleButton(id, btn_r * 2, btn_r * 2)
+    local hovered = ImGui.IsItemHovered()
+    local active = ImGui.IsItemActive()
+
+    if active then
+        local mx, my = ImGui.GetMousePos()
+        local deg = (math.deg(math.atan2(my - center.y, mx - center.x))) % 360
+        if state.ring_drag_id ~= id then
+            -- The drag only starts once the press strays, so a click stays a click.
+            if state.ring_press_id ~= id then
+                state.ring_press_id = id
+                state.ring_press_deg = deg
+            elseif AngularDiff(deg, state.ring_press_deg or deg) > 6 then
+                state.ring_drag_id = id
+            end
+        end
+        if state.ring_drag_id == id then
+            state[angle_key] = ClampRingAngle(deg)
+        end
+    end
+
+    -- A release that ended a drag is not a click.
+    local clicked = pressed and state.ring_drag_id ~= id
+    if not active then
+        if state.ring_press_id == id then state.ring_press_id = nil end
+        if state.ring_drag_id == id then state.ring_drag_id = nil end
+    end
+
+    local fill = (hovered or active) and ImGui.GetColorU32(0.28, 0.28, 0.34, 1)
+        or ImGui.GetColorU32(0.10, 0.10, 0.13, 0.95)
+    local rim = ImGui.GetColorU32(state.border_color[1], state.border_color[2],
+        state.border_color[3], state.border_color[4])
+    draw_list:AddCircleFilled(ImVec2.new(bx, by), btn_r, fill)
+    draw_list:AddCircle(ImVec2.new(bx, by), btn_r, rim, 0, 1.5)
+
+    local text_w, text_h = ImGui.CalcTextSize(label)
+    draw_list:AddText(ImVec2.new(bx - text_w * 0.5, by - text_h * 0.5),
+        ImGui.GetColorU32(1, 1, 1, 1), label)
+
+    if hovered and tooltip ~= nil then
+        ImGui.BeginTooltip()
+        ImGui.TextUnformatted(tooltip)
+        ImGui.EndTooltip()
+    end
+    return clicked
+end
+
+-- The local time in a rounded box pinned to the bottom of the rim. The rim
+-- buttons are clamped away from this stretch, so nothing lands on top of it.
+local function DrawClock(draw_list, center, rim_radius)
+    local text = os.date(state.clock_24h and "%H:%M" or "%I:%M %p")
+    if not state.clock_24h then
+        text = text:gsub("^0", "")
+    end
+    local text_w, text_h = ImGui.CalcTextSize(text)
+    local w, h = text_w + 16, text_h + 6
+    local cx, cy = center.x, center.y + rim_radius
+
+    local rim = ImGui.GetColorU32(state.border_color[1], state.border_color[2],
+        state.border_color[3], state.border_color[4])
+    draw_list:AddRectFilled(ImVec2.new(cx - w / 2, cy - h / 2),
+        ImVec2.new(cx + w / 2, cy + h / 2), ImGui.GetColorU32(0.08, 0.08, 0.11, 0.95), h / 2)
+    draw_list:AddRect(ImVec2.new(cx - w / 2, cy - h / 2),
+        ImVec2.new(cx + w / 2, cy + h / 2), rim, h / 2, 0, 1.5)
+    draw_list:AddText(ImVec2.new(cx - text_w / 2, cy - text_h / 2),
+        ImGui.GetColorU32(1, 1, 1, 1), text)
+end
+
+-- The fonts on offer, from the shared resources folder.
+local MAP_FONTS = {
+    { name = "Default" },
+    { name = "Cinzel", path = "fonts/Cinzel/static/Cinzel-Regular.ttf" },
+    { name = "Libre Baskerville", path = "fonts/Libre_Baskerville/static/LibreBaskerville-Regular.ttf" },
+    { name = "Merriweather Sans", path = "fonts/Merriweather_Sans/static/MerriweatherSans-Regular.ttf" },
+}
+local DEFAULT_FONT_SIZE = 13
+
+-- Pushes the chosen font for the map window. The host caches fonts per file
+-- and size, so pushing every frame is cheap. Returns whether a pop is owed.
+local function PushMapFont()
+    for _, font in ipairs(MAP_FONTS) do
+        if font.name == state.font_name and font.path ~= nil then
+            ImGui.PushFont(UiForge.LoadFont(font.path, state.font_size))
+            return true
+        end
+    end
+    return false
+end
+
+-- Call inside the window. Sizes the default font, which has no file to
+-- reload at another size. A file backed font is already at its size.
+local function ApplyMapFontScale()
+    if state.font_name == "Default" then
+        ImGui.SetWindowFontScale(state.font_size / DEFAULT_FONT_SIZE)
+    else
+        ImGui.SetWindowFontScale(1)
+    end
+end
+
+local function Render()
+    if Util.IsInGame() == 0 then return end
+    -- An overlay floating over the pause screen is just in the way.
+    if Util.IsStartMenuOpen() ~= 0 then return end
+    if not WorldGeometry.IsAvailable() then return end
+
     TryLoadTrackedEntitiesOnce()
 
-    mini_map_state.initialized = true
+    local pos = Player.GetCoordinates()
+    local heading = Util.GetCompassRadians()
+
+    if state.rebuild == nil then
+        local cut_y = CeilingCut(pos.x, pos.y, pos.z)
+        if NeedsRebuild(pos.x, pos.y, pos.z, cut_y) then
+            StartRebuild(pos.x, pos.y, pos.z, cut_y)
+        end
+    end
+    StepRebuild()
+
+    local font_pushed = PushMapFont()
+    if ImGui.Begin("mini map window", true, state.window_flags) then
+        ApplyMapFontScale()
+        local view_px = state.view_size
+        local circular = state.circular and not state.rotate_with_player
+
+        -- The disc's rim buttons and clock hang past the map square, so the
+        -- window claims a padded square and the map sits centered in it.
+        local pad = circular and 18 or 0
+        ImGui.Dummy(view_px + pad * 2, view_px + pad * 2)
+        local draw_list = ImGui.GetWindowDrawList()
+        local wx, wy = ImGui.GetItemRectMin()
+        local origin = { x = wx + pad, y = wy + pad }
+        local center = ImVec2.new(origin.x + view_px * 0.5, origin.y + view_px * 0.5)
+        local scale = view_px / (2 * ViewRadius())
+        local half = view_px * 0.5
+
+        ImGui.PushClipRect(origin.x, origin.y, origin.x + view_px, origin.y + view_px, true)
+
+        if circular then
+            -- The backing disc, for the stretch of rim the texture has not
+            -- reached yet and for the see-through background color.
+            draw_list:AddCircleFilled(center, half,
+                ImGui.GetColorU32(state.background_color[1], state.background_color[2],
+                                  state.background_color[3], state.background_color[4]))
+        end
+
+        DrawMapTexture(draw_list, origin, view_px, pos.x, pos.z, heading)
+
+        if state.show_entities then
+            DrawEntities(draw_list, center, pos.x, pos.y, pos.z, scale, heading, view_px, origin)
+        end
+        if state.show_player then
+            DrawPlayerArrow(draw_list, center, heading)
+        end
+
+        ImGui.PopClipRect()
+
+        local border_color = ImGui.GetColorU32(state.border_color[1], state.border_color[2],
+            state.border_color[3], state.border_color[4])
+
+        if circular then
+            if state.show_border then
+                draw_list:AddCircle(center, half, border_color, 0, 2.0)
+            end
+            if state.show_clock then
+                DrawClock(draw_list, center, half)
+            end
+            if RingButton(draw_list, "ring_zoom_in", "+", center, half, "zoom_plus_angle",
+                "Zoom in\nDrag to move this button around the rim") then
+                SetViewRadius(ViewRadius() / 1.25)
+            end
+            if RingButton(draw_list, "ring_zoom_out", "-", center, half, "zoom_minus_angle",
+                "Zoom out\nDrag to move this button around the rim") then
+                SetViewRadius(ViewRadius() * 1.25)
+            end
+            if RingButton(draw_list, "ring_cut_up", "^", center, half, "cut_up_angle",
+                CutTooltip(1)) then
+                AdjustCutHeight(1)
+            end
+            if RingButton(draw_list, "ring_cut_down", "v", center, half, "cut_down_angle",
+                CutTooltip(-1)) then
+                AdjustCutHeight(-1)
+            end
+        else
+            if state.show_border then
+                draw_list:AddRect(ImVec2.new(origin.x, origin.y),
+                    ImVec2.new(origin.x + view_px, origin.y + view_px),
+                    border_color, 0, 0, 1.5)
+            end
+
+            -- Zoom and cut controls in the window corner
+            ImGui.SetCursorScreenPos(origin.x + 4, origin.y + view_px - 24)
+            if ImGui.SmallButton("-") then
+                SetViewRadius(ViewRadius() * 1.25)
+            end
+            ImGui.SameLine()
+            if ImGui.SmallButton("+") then
+                SetViewRadius(ViewRadius() / 1.25)
+            end
+            ImGui.SameLine()
+            if ImGui.SmallButton("^") then
+                AdjustCutHeight(1)
+            end
+            Tooltip(CutTooltip(1))
+            ImGui.SameLine()
+            if ImGui.SmallButton("v") then
+                AdjustCutHeight(-1)
+            end
+            Tooltip(CutTooltip(-1))
+        end
+    end
+    ImGui.End()
+    if font_pushed then
+        ImGui.PopFont()
+    end
+end
+
+-- ---------------------------------------------------------------------------
+-- Settings / persistence
+-- ---------------------------------------------------------------------------
+
+local function ToggleCompass()
+    if state.disable_compass then UI.DisableCompass() else UI.EnableCompass() end
+end
+
+local function TrackedEntitiesSettings()
+    ImGui.Separator()
+    ImGui.Text("Entity Tracking")
+    state.entity_tracking_enabled  = ImGui.Checkbox("Enable Entity Tracking", state.entity_tracking_enabled)
+    state.ping_tracked_entities    = ImGui.Checkbox("Ping Tracked Entities", state.ping_tracked_entities)
+    state.line_to_tracked_entities = ImGui.Checkbox("Line to Tracked Entities", state.line_to_tracked_entities)
+
+    ImGui.TextDisabled("Type a name and press Enter to track")
+    local enter_returns_true_flag = (ImGuiInputTextFlags and ImGuiInputTextFlags.EnterReturnsTrue) or 0
+    local new_text, enter_pressed = ImGui.InputText("Track Entity", state.tracked_entity_input, enter_returns_true_flag)
+    state.tracked_entity_input = new_text
+    if enter_pressed then
+        AddTrackedEntity(state.tracked_entity_input)
+        state.tracked_entity_input = ""
+    end
+
+    if state.tracked_entities_status ~= "" then
+        ImGui.TextDisabled(state.tracked_entities_status)
+    end
+
+    if not ImGui.CollapsingHeader("Tracked Entities") then return end
+
+    local active_file = SanitizeFileName(state.tracked_entities_file_name)
+
+    ImGui.Text("Active List:")
+    ImGui.SameLine()
+    if ImGui.BeginCombo("##trackedEntitiesList", active_file) then
+        if state.tracked_entities_combo_was_open ~= true then
+            RefreshTrackedEntitiesAvailableLists()
+        end
+        state.tracked_entities_combo_was_open = true
+
+        local lists = state.tracked_entities_available_lists or {}
+        local active_key = active_file:lower()
+        if #lists == 0 then
+            ImGui.TextDisabled("(no .entl files found)")
+        else
+            for _, file_name in ipairs(lists) do
+                local is_selected = (file_name:lower() == active_key)
+                if ImGui.Selectable(file_name, is_selected) then
+                    state.tracked_entities_file_name = SanitizeFileName(file_name)
+                    LoadTrackedEntitiesFromFile()
+                    state.tracked_entities_loaded = true
+                    active_key = state.tracked_entities_file_name:lower()
+                end
+                if is_selected then
+                    ImGui.SetItemDefaultFocus()
+                end
+            end
+        end
+
+        if state.tracked_entities_lists_status ~= "" then
+            ImGui.Separator()
+            ImGui.TextDisabled(state.tracked_entities_lists_status)
+        end
+
+        ImGui.EndCombo()
+    else
+        state.tracked_entities_combo_was_open = false
+    end
+
+    if ImGui.Button("Clear All Tracked") then
+        ClearTrackedEntities()
+    end
+    ImGui.SameLine()
+    if ImGui.Button("Save") then
+        SaveTrackedEntitiesToFile()
+    end
+    ImGui.SameLine()
+    if ImGui.Button("Save As...") then
+        OpenSaveTrackedEntitiesAsPopup()
+    end
+
+    RenderSaveTrackedEntitiesAsPopup()
+
+    for i = 1, #state.tracked_entities do
+        local entry = state.tracked_entities[i]
+        ImGui.PushID(entry.key or i)
+
+        entry.enabled = ImGui.Checkbox("##enabled", entry.enabled)
+        ImGui.SameLine()
+        ImGui.TextUnformatted(entry.name)
+        ImGui.SameLine()
+        if ImGui.Button("X##remove") then
+            ImGui.PopID()
+            RemoveTrackedEntityAtIndex(i)
+            break
+        end
+
+        ImGui.SameLine()
+        entry.fill_color = ImGui.ColorEdit4("Fill Color", entry.fill_color, ImGuiColorEditFlags.NoInputs)
+        ImGui.SameLine()
+        entry.border_color = ImGui.ColorEdit4("Border Color", entry.border_color, ImGuiColorEditFlags.NoInputs)
+
+        ImGui.Separator()
+        ImGui.PopID()
+    end
+end
+
+--- A float slider that reads and types in hundredths. Ctrl+click turns it into
+--- a text box, and whatever comes back (dragged or typed) is rounded to two
+--- decimals and clamped to the range, so a typed 1000 cannot blow past the max.
+local function SliderFloat(label, value, min, max)
+    local new_value = ImGui.SliderFloat(label, value, min, max, "%.2f",
+                                        ImGuiSliderFlags.AlwaysClamp)
+    if new_value < min then new_value = min end
+    if new_value > max then new_value = max end
+    return math.floor(new_value * 100 + 0.5) / 100
 end
 
 local function Settings()
     TryLoadTrackedEntitiesOnce()
-    
-    local is_compass_disabled, compass_check_pressed = ImGui.Checkbox("Disable Compass", mini_map_state.disable_compass)
-    -- We perform this check here so we do not write NOP to the compass code every single frame.
-    if compass_check_pressed then
-        mini_map_state.disable_compass = is_compass_disabled
+
+    ImGui.TextDisabled("Ctrl+click a slider to type an exact value")
+
+    local mode = state.textured and "Textured" or "Flat"
+    if ImGui.BeginCombo("Render Mode", mode) then
+        if ImGui.Selectable("Textured", state.textured) and not state.textured then
+            state.textured = true
+            state.built = nil
+        end
+        if ImGui.Selectable("Flat", not state.textured) and state.textured then
+            state.textured = false
+            state.built = nil
+        end
+        ImGui.EndCombo()
+    end
+    Tooltip("Textured: draws the world's real textures from above, so roofs,\n"
+        .. "roads, and terrain look like the world does.\n\n"
+        .. "Flat: ignores textures and colors surfaces by height alone, low to\n"
+        .. "high. Reads better in caves and open terrain, and builds faster.")
+
+    if state.textured then
+        local lighting = ImGui.Checkbox("World Lighting", state.world_lighting)
+        if lighting ~= state.world_lighting then
+            state.world_lighting = lighting
+            state.built = nil
+        end
+        Tooltip("Tints the map with the world's own lighting, which follows the\n"
+            .. "time of day. Torches and campfires glow, but at night most of\n"
+            .. "the map goes black. Off shows the art unlit at full strength.")
+
+        local brightness = SliderFloat("Brightness", state.brightness, 0.5, 3.0)
+        if brightness ~= state.brightness then
+            state.brightness = brightness
+            state.built = nil
+        end
+        Tooltip("Multiplies the sampled texture colors. Raise it to lift dark\n"
+            .. "dungeon art out of the murk, lower it to tone the map down.\n"
+            .. "Colors are clamped, so pushing it high flattens toward white.")
+    end
+
+    local compass_disabled, compass_pressed = ImGui.Checkbox("Disable Compass", state.disable_compass)
+    if compass_pressed then
+        state.disable_compass = compass_disabled
         ToggleCompass()
     end
 
-    -- mini_map_state.disable_in_start_menu = ImGui.CheckBox("Hide When Start Menu is Open", mini_map_state.disable_in_start_menu)
+    state.view_size   = ImGui.SliderInt("Map Size (px)", state.view_size, 100, 600, "%d")
+    state.view_radius = SliderFloat("Zoom (world radius)", state.view_radius,
+                                    state.min_radius, state.max_radius)
+    Tooltip("How much of the world the map covers, from the center to the edge,\n"
+        .. "in world units. Smaller zooms in.")
 
-    mini_map_state.map_scale    = ImGui.SliderFloat("Map Scale", mini_map_state.map_scale, 0.1, 5.0, tostring(mini_map_state.map_scale))
-    mini_map_state.map_zoom     = ImGui.SliderInt("Map Zoom", mini_map_state.map_zoom, 1, 5, tostring(mini_map_state.map_zoom))
-    mini_map_state.map_texture_tint     = ImGui.ColorEdit4("Map Tint", mini_map_state.map_texture_tint)
+    state.auto_zoom = ImGui.Checkbox("Auto Zoom Indoors", state.auto_zoom)
+    Tooltip("Switches to the indoor zoom below whenever the ceiling probe finds\n"
+        .. "a roof overhead, and back to the outdoor zoom under open sky.\n"
+        .. "Needs Auto Ceiling Cut on, since that is what detects the roof.\n"
+        .. "The two zooms are kept apart, so zooming while inside a cave does\n"
+        .. "not disturb the zoom you set out in the world.")
 
-    mini_map_state.show_map_border      = ImGui.Checkbox("Show Map Border", mini_map_state.show_map_border)
-    mini_map_state.map_border_color     = ImGui.ColorEdit4("Map Border Color", mini_map_state.map_border_color)
-    mini_map_state.map_border_thickness = ImGui.SliderFloat("Map Border Thickness", mini_map_state.map_border_thickness, 0.1, 2, tostring(mini_map_state.map_border_thickness))
+    if state.auto_zoom then
+        state.indoor_view_radius = SliderFloat("Indoor Zoom (world radius)",
+            state.indoor_view_radius, state.min_radius, state.max_radius)
+        Tooltip("The zoom used while a ceiling is overhead. Rooms and corridors\n"
+            .. "want far less of the world on screen than a hillside does.")
+        if not state.auto_ceiling then
+            ImGui.TextDisabled("Auto Ceiling Cut is off, so no ceiling is ever detected")
+        end
+    end
 
-    mini_map_state.player_indicator_scale = ImGui.SliderFloat("Player Scale", mini_map_state.player_indicator_scale, 0.1, 5.0, tostring(mini_map_state.player_indicator_scale))
+    state.rotate_with_player = ImGui.Checkbox("Rotate With Player", state.rotate_with_player)
 
-    mini_map_state.show_player_indicator_border    = ImGui.Checkbox("Show Player Indicator Border", mini_map_state.show_player_indicator_border)
-    mini_map_state.player_indicator_border_color   = ImGui.ColorEdit4("Player Indicator Border Color", mini_map_state.player_indicator_border_color)
-
-    mini_map_state.show_player_indicator_fill   = ImGui.Checkbox("Show Player Indicator Fill", mini_map_state.show_player_indicator_fill)
-    mini_map_state.player_indicator_fill_color  = ImGui.ColorEdit4("Player Indicator Fill Color", mini_map_state.player_indicator_fill_color)
-
-    mini_map_state.show_entities            = ImGui.Checkbox("Show Entities", mini_map_state.show_entities)
-    mini_map_state.entity_radius            = ImGui.SliderFloat("Entity Size", mini_map_state.entity_radius, 1, 6, tostring(mini_map_state.entity_radius))
-    
-    mini_map_state.show_entity_border       = ImGui.Checkbox("Show Entity Border", mini_map_state.show_entity_border)
-    mini_map_state.entity_border_thickness  = ImGui.SliderFloat("Entity Border Thickness", mini_map_state.entity_border_thickness, 0, mini_map_state.entity_radius - 1, tostring(mini_map_state.entity_border_thickness))
-    mini_map_state.entity_border_color      = ImGui.ColorEdit4("Entity Border Color", mini_map_state.entity_border_color)
+    if ImGui.BeginCombo("Map Font", state.font_name) then
+        for _, font in ipairs(MAP_FONTS) do
+            if ImGui.Selectable(font.name, font.name == state.font_name) then
+                state.font_name = font.name
+            end
+        end
+        ImGui.EndCombo()
+    end
+    state.font_size = ImGui.SliderInt("Font Size (px)", state.font_size, 8, 32, "%d")
+    Tooltip("The font for the clock, the rim buttons, and the map's tooltips.")
 
     ImGui.Separator()
-    ImGui.Text("Entity Tracking")
-    mini_map_state.entity_tracking_enabled  = ImGui.Checkbox("Enable Entity Tracking", mini_map_state.entity_tracking_enabled)
-    mini_map_state.ping_tracked_entities    = ImGui.Checkbox("Ping Tracked Entities", mini_map_state.ping_tracked_entities)
-    mini_map_state.line_to_tracked_entities = ImGui.Checkbox("Line to Tracked Entities", mini_map_state.line_to_tracked_entities)
-
-    ImGui.TextDisabled("Type a name and press Enter to track")
-    local enter_returns_true_flag = (ImGuiInputTextFlags and ImGuiInputTextFlags.EnterReturnsTrue) or 0
-    local new_text, enter_pressed = ImGui.InputText("Track Entity", mini_map_state.tracked_entity_input, enter_returns_true_flag)
-    mini_map_state.tracked_entity_input = new_text
-    if enter_pressed then
-        AddTrackedEntity(mini_map_state.tracked_entity_input)
-        mini_map_state.tracked_entity_input = ""
+    ImGui.Text("Height Slicing")
+    local auto = ImGui.Checkbox("Auto Ceiling Cut", state.auto_ceiling)
+    if auto ~= state.auto_ceiling then
+        state.auto_ceiling = auto
+        state.probe = nil
+        state.built = nil
     end
 
-    if mini_map_state.tracked_entities_status ~= "" then
-        ImGui.TextDisabled(mini_map_state.tracked_entities_status)
+    if state.auto_ceiling then
+        ImGui.TextDisabled(state.indoors and "under a ceiling, cutting below it"
+                           or "open sky, showing everything")
+        local margin = SliderFloat("Cut Below Ceiling", state.ceiling_margin, 0, 20)
+        if margin ~= state.ceiling_margin then
+            state.ceiling_margin = margin
+            state.built = nil
+        end
+        Tooltip("How far under the ceiling the map slices once a ceiling is\n"
+            .. "found. Raise it if the roof itself bleeds into the map, lower\n"
+            .. "it to keep rafters, lofts, and upper shelves visible.")
+
+        local clearance = SliderFloat("Head Clearance", state.head_clearance, 0, 60)
+        if clearance ~= state.head_clearance then
+            state.head_clearance = clearance
+            state.probe = nil
+            state.built = nil
+        end
+        Tooltip("Geometry closer than this above you is ignored when looking for\n"
+            .. "a ceiling, so a low doorframe or an overhang you are brushing\n"
+            .. "does not count as a roof. Raise it if the map keeps cutting low\n"
+            .. "when you are actually outdoors.")
+
+        local search = SliderFloat("Ceiling Search Height", state.ceiling_search, 20, 600)
+        if search ~= state.ceiling_search then
+            state.ceiling_search = search
+            state.probe = nil
+            state.built = nil
+        end
+        Tooltip("How far overhead to look before giving up and calling it open\n"
+            .. "sky. Raise it for tall cathedral rooms and big cave ceilings,\n"
+            .. "lower it so distant overhead terrain (a bridge, a cliff you are\n"
+            .. "under) stops reading as indoors.")
+    else
+        local ceiling = SliderFloat("Ceiling Cut", state.ceiling_offset, 0, 600)
+        if ceiling ~= state.ceiling_offset then
+            state.ceiling_offset = ceiling
+            state.built = nil
+        end
+        Tooltip("Cuts away geometry that starts higher than this above you, so a\n"
+            .. "roof or the terrain overhead stops hiding the room you are in.")
     end
 
-    if ImGui.CollapsingHeader("Tracked Entities") then
-        local active_file = SanitizeFileName(mini_map_state.tracked_entities_file_name)
-
-        ImGui.Text("Active List:")
-        ImGui.SameLine()
-        local combo_open = ImGui.BeginCombo("##trackedEntitiesList", active_file)
-        if combo_open then
-            if mini_map_state._tracked_entities_combo_was_open ~= true then
-                RefreshTrackedEntitiesAvailableLists()
-            end
-            mini_map_state._tracked_entities_combo_was_open = true
-
-            local lists = mini_map_state.tracked_entities_available_lists or {}
-            local active_key = active_file:lower()
-            if #lists == 0 then
-                ImGui.TextDisabled("(no .entl files found)")
-            else
-                for _, file_name in ipairs(lists) do
-                    local is_selected = (file_name:lower() == active_key)
-                    if ImGui.Selectable(file_name, is_selected) then
-                        local selected_file = SanitizeFileName(file_name)
-                        mini_map_state.tracked_entities_file_name = selected_file
-                        LoadTrackedEntitiesFromFile()
-                        mini_map_state.tracked_entities_loaded = true
-                        active_key = selected_file:lower()
-                    end
-                    if is_selected then
-                        ImGui.SetItemDefaultFocus()
-                    end
-                end
-            end
-
-            if mini_map_state.tracked_entities_lists_status ~= "" then
-                ImGui.Separator()
-                ImGui.TextDisabled(mini_map_state.tracked_entities_lists_status)
-            end
-
-            ImGui.EndCombo()
-        else
-            mini_map_state._tracked_entities_combo_was_open = false
-        end
-
-        if ImGui.Button("Clear All Tracked") then
-            ClearTrackedEntities()
-        end
-        ImGui.SameLine()
-        if ImGui.Button("Save") then
-            SaveTrackedEntitiesToFile()
-        end
-        ImGui.SameLine()
-        if ImGui.Button("Save As...") then
-            OpenSaveTrackedEntitiesAsPopup()
-        end
-
-        RenderSaveTrackedEntitiesAsPopup()
-
-        for i = 1, #mini_map_state.tracked_entities do
-            local entry = mini_map_state.tracked_entities[i]
-            ImGui.PushID(entry.key or i)
-
-            entry.enabled = ImGui.Checkbox("##enabled", entry.enabled)
-            ImGui.SameLine()
-            ImGui.TextUnformatted(entry.name)
-            ImGui.SameLine()
-            if ImGui.Button("X##remove") then
-                ImGui.PopID()
-                RemoveTrackedEntityAtIndex(i)
-                break
-            end
-
-            ImGui.SameLine()
-            entry.fill_color = ImGui.ColorEdit4("Fill Color", entry.fill_color, ImGuiColorEditFlags.NoInputs)
-            ImGui.SameLine()
-            entry.border_color = ImGui.ColorEdit4("Border Color", entry.border_color, ImGuiColorEditFlags.NoInputs)
-
-            ImGui.Separator()
-            ImGui.PopID()
+    if not state.textured then
+        state.floor_range = SliderFloat("Shade Range Below", state.floor_range, 20, 400)
+        local above = SliderFloat("Shade Range Above", state.above_range, 20, 600)
+        if above ~= state.above_range then
+            state.above_range = above
+            state.built = nil
         end
     end
-    -- ImGui.Text("If the mini-map seems a a little bit off,\nuse these sliders to adjust your position on the map.")
-    -- mini_map_state.map_texture_offset_x    = ImGui.SliderInt("X offset", mini_map_state.map_texture_offset_x, 0, 300, tostring(mini_map_state.map_texture_offset_x))
-    -- mini_map_state.map_texture_offset_y    = ImGui.SliderInt("Y offset", mini_map_state.map_texture_offset_y, 0, 300, tostring(mini_map_state.map_texture_offset_y))
+
+    ImGui.Separator()
+    ImGui.Text("Overlay")
+    state.circular = ImGui.Checkbox("Circular Frame", state.circular)
+    Tooltip("Draws the map as a disc with the zoom and cut height buttons\n"
+        .. "sitting on the rim. Drag a rim button to slide it around the\n"
+        .. "circumference. Rotate With Player still uses the square map,\n"
+        .. "since a rotated image cannot be clipped to a circle.")
+    if state.circular and state.rotate_with_player then
+        ImGui.TextDisabled("Rotate With Player is on, so the square map is shown")
+    end
+    if state.circular then
+        state.show_clock = ImGui.Checkbox("Clock On The Rim", state.show_clock)
+        Tooltip("Your machine's local time, in a rounded box pinned to the\n"
+            .. "bottom of the rim. The rim buttons cannot be dragged onto it.")
+        if state.show_clock then
+            state.clock_24h = ImGui.Checkbox("24 Hour Clock", state.clock_24h)
+        end
+    end
+    state.show_player   = ImGui.Checkbox("Show Player Arrow", state.show_player)
+    state.show_border   = ImGui.Checkbox("Show Border", state.show_border)
+    state.border_color  = ImGui.ColorEdit4("Border Color", state.border_color)
+    state.background_color = ImGui.ColorEdit4("Background", state.background_color)
+
+    ImGui.Separator()
+    ImGui.Text("Entities")
+    state.show_entities  = ImGui.Checkbox("Show Entities", state.show_entities)
+    state.entity_radius  = SliderFloat("Entity Size", state.entity_radius, 1, 6)
+    state.entity_y_range = SliderFloat("Entity Height Range", state.entity_y_range, 10, 300)
+    state.show_entity_border      = ImGui.Checkbox("Show Entity Border", state.show_entity_border)
+    state.entity_border_thickness = SliderFloat("Entity Border Thickness",
+        state.entity_border_thickness, 0, math.max(1, state.entity_radius - 1))
+    state.entity_border_color     = ImGui.ColorEdit4("Entity Border Color", state.entity_border_color)
+
+    TrackedEntitiesSettings()
+
+    ImGui.Separator()
+    ImGui.Text("Performance")
+    state.tris_per_frame = ImGui.SliderInt("Triangles / Frame", state.tris_per_frame, 1000, 40000, "%d")
+    Tooltip("How much of the map is drawn each frame. The map rebuilds over\n"
+        .. "several frames as you move, and the old one stays on screen until\n"
+        .. "the new one is done. Raise it so the map keeps up while running,\n"
+        .. "lower it if rebuilding costs you frames in game.")
+
+    state.tex_size = ImGui.SliderInt("Texture Size", state.tex_size, 256, 1024, "%d")
+    Tooltip("Resolution of the map image, in pixels per side. Higher is sharper\n"
+        .. "when zoomed in, but every rebuild costs more to rasterize and\n"
+        .. "upload. 512 is a good balance.")
+
+    ImGui.TextDisabled(string.format("last build: %d tris, %d rooms",
+        state.debug_stats.tris, state.debug_stats.cells))
 end
 
--- Returns a plain data table of every user customizable option. UiForge captures
--- this into the profile on File > Save Profile and hands it back to Load when a
--- profile is applied. Textures and runtime caches are intentionally not saved.
--- The tracked entity entries themselves live in .entl files, so only the active
--- list file name and the tracking toggles are saved here.
+-- Returns a plain data table of every user customizable option. The tracked
+-- entity entries themselves live in .entl files, so only the active list file
+-- name and the tracking toggles are saved here.
 local function Save()
-    local state = mini_map_state
     return {
-        disable_compass                 = state.disable_compass,
-        disable_in_start_menu           = state.disable_in_start_menu,
+        textured = state.textured,
+        world_lighting = state.world_lighting,
+        brightness = state.brightness,
+        view_size = state.view_size,
+        view_radius = state.view_radius,
+        auto_zoom = state.auto_zoom,
+        indoor_view_radius = state.indoor_view_radius,
+        rotate_with_player = state.rotate_with_player,
+        auto_ceiling = state.auto_ceiling,
+        ceiling_offset = state.ceiling_offset,
+        ceiling_margin = state.ceiling_margin,
+        head_clearance = state.head_clearance,
+        ceiling_search = state.ceiling_search,
+        floor_range = state.floor_range,
+        above_range = state.above_range,
+        tex_size = state.tex_size,
+        tris_per_frame = state.tris_per_frame,
+        show_player = state.show_player,
+        show_border = state.show_border,
+        border_color = state.border_color,
+        background_color = state.background_color,
 
-        map_scale                       = state.map_scale,
-        map_zoom                        = state.map_zoom,
-        map_texture_tint                = state.map_texture_tint,
-        show_map_border                 = state.show_map_border,
-        map_border_color                = state.map_border_color,
-        map_border_thickness            = state.map_border_thickness,
+        circular = state.circular,
+        zoom_plus_angle = state.zoom_plus_angle,
+        zoom_minus_angle = state.zoom_minus_angle,
+        cut_up_angle = state.cut_up_angle,
+        cut_down_angle = state.cut_down_angle,
+        show_clock = state.show_clock,
+        clock_24h = state.clock_24h,
 
-        player_indicator_scale          = state.player_indicator_scale,
-        show_player_indicator_border    = state.show_player_indicator_border,
-        player_indicator_border_color   = state.player_indicator_border_color,
-        show_player_indicator_fill      = state.show_player_indicator_fill,
-        player_indicator_fill_color     = state.player_indicator_fill_color,
+        show_entities = state.show_entities,
+        entity_radius = state.entity_radius,
+        entity_y_range = state.entity_y_range,
+        show_entity_border = state.show_entity_border,
+        entity_border_color = state.entity_border_color,
+        entity_border_thickness = state.entity_border_thickness,
+        entity_red_color = state.entity_red_color,
+        entity_yellow_color = state.entity_yellow_color,
+        entity_white_color = state.entity_white_color,
+        entity_dark_blue_color = state.entity_dark_blue_color,
+        entity_light_blue_color = state.entity_light_blue_color,
+        entity_green_color = state.entity_green_color,
+        entity_gray_color = state.entity_gray_color,
 
-        show_entities                   = state.show_entities,
-        entity_radius                   = state.entity_radius,
-        show_entity_border              = state.show_entity_border,
-        entity_border_thickness         = state.entity_border_thickness,
-        entity_border_color             = state.entity_border_color,
+        entity_tracking_enabled = state.entity_tracking_enabled,
+        ping_tracked_entities = state.ping_tracked_entities,
+        line_to_tracked_entities = state.line_to_tracked_entities,
+        tracked_entities_file_name = state.tracked_entities_file_name,
 
-        entity_tracking_enabled         = state.entity_tracking_enabled,
-        ping_tracked_entities           = state.ping_tracked_entities,
-        line_to_tracked_entities        = state.line_to_tracked_entities,
-        tracked_entities_file_name      = state.tracked_entities_file_name,
+        disable_compass = state.disable_compass,
+
+        font_name = state.font_name,
+        font_size = state.font_size,
     }
-end
-
--- Copies a saved value into state only when its type matches the current value,
--- so a hand edited or stale profile cannot corrupt the state table.
-local function ApplySavedValue(saved, key)
-    local state = mini_map_state
-    if saved[key] ~= nil and type(saved[key]) == type(state[key]) then
-        state[key] = saved[key]
-    end
 end
 
 local function Load(saved)
     if type(saved) ~= "table" then return end
 
-    local simple_keys = {
-        "disable_in_start_menu",
-        "map_scale", "map_zoom", "map_texture_tint",
-        "show_map_border", "map_border_color", "map_border_thickness",
-        "player_indicator_scale",
-        "show_player_indicator_border", "player_indicator_border_color",
-        "show_player_indicator_fill", "player_indicator_fill_color",
-        "show_entities", "entity_radius",
-        "show_entity_border", "entity_border_thickness", "entity_border_color",
-        "entity_tracking_enabled", "ping_tracked_entities", "line_to_tracked_entities",
-    }
-    for _, key in ipairs(simple_keys) do
-        ApplySavedValue(saved, key)
+    -- Copy a saved value only when its type matches the current one, so a hand
+    -- edited or stale profile cannot corrupt the state table.
+    for key, value in pairs(saved) do
+        if key ~= "disable_compass" and key ~= "tracked_entities_file_name"
+           and state[key] ~= nil and type(value) == type(state[key]) then
+            state[key] = value
+        end
     end
 
-    -- Reapply the compass patch unconditionally. Disabling the script (or
-    -- applying another profile) restores the game compass via RestoreGameUi
-    -- WITHOUT changing this setting, so the in-game UI can be out of sync with
-    -- the saved value even when the two compare equal. Always re-assert it.
+    -- Reapply the compass patch unconditionally. Disabling the script restores
+    -- the game compass without changing this setting, so the game UI can be out
+    -- of sync with the saved value even when the two compare equal.
     if type(saved.disable_compass) == "boolean" then
-        mini_map_state.disable_compass = saved.disable_compass
+        state.disable_compass = saved.disable_compass
     end
     ToggleCompass()
 
-    -- Restore the active tracked entities list and load it from disk
     if type(saved.tracked_entities_file_name) == "string" and saved.tracked_entities_file_name ~= "" then
-        mini_map_state.tracked_entities_file_name = SanitizeFileName(saved.tracked_entities_file_name)
-        mini_map_state.tracked_entities_file_name_buffer = mini_map_state.tracked_entities_file_name
+        state.tracked_entities_file_name = SanitizeFileName(saved.tracked_entities_file_name)
+        state.tracked_entities_file_name_buffer = state.tracked_entities_file_name
         LoadTrackedEntitiesFromFile()
-        mini_map_state.tracked_entities_loaded = true
+        state.tracked_entities_loaded = true
     end
+
+    state.probe = nil
+    state.built = nil
 end
 
--- Leave the game the way we found it when the script is disabled or UiForge ejects
-local function RestoreGameUi()
+local function Cleanup()
     UI.EnableCompass()
+    if state.texture ~= nil then
+        UiForge.ReleaseTexture(state.texture)
+        state.texture = nil
+    end
+    state.built = nil
+    state.rebuild = nil
+    state.probe = nil
+    WorldGeometry.ClearCache()
+    state.initialized = false
+end
+
+local function Initialize()
+    ToggleCompass()
+    TryLoadTrackedEntitiesOnce()
+    state.initialized = true
 end
 
 local function RegisterSettings()
     UiForge.RegisterCallback(UiForge.CallbackType.Settings, Settings)
     UiForge.RegisterCallback(UiForge.CallbackType.Save, Save)
     UiForge.RegisterCallback(UiForge.CallbackType.Load, Load)
-    UiForge.RegisterCallback(UiForge.CallbackType.DisableScript, RestoreGameUi)
-    UiForge.RegisterCallback(UiForge.CallbackType.OnEject, RestoreGameUi)
-    mini_map_state.settings_registered = true
+    UiForge.RegisterCallback(UiForge.CallbackType.DisableScript, Cleanup)
+    UiForge.RegisterCallback(UiForge.CallbackType.OnEject, Cleanup)
+    state.settings_registered = true
 end
-
-local function Render()
-
-    local state = mini_map_state -- Shortcut for readability
-
-    -- If we are not in game or if the start menu is open, don't display minimap
-    if Util.IsInGame() == 0 or (state.disable_in_start_menu and Util.IsStartMenuOpen() == 1) then return end
-
-    TryLoadTrackedEntitiesOnce()
-
-    if ImGui.Begin("mini map window", true, state.window_flags) then
-        local cursor_x, cursor_y = ImGui.GetCursorPos()
-
-        local scaled_mini_map_width, scaled_mini_map_height = ScaleVec2(state.mini_map_width, state.mini_map_height, state.map_scale)
-        local draw_list = ImGui.GetWindowDrawList()
-
-        -- Draw the border of the mini map
-        if state.show_map_border then
-            -- local line_color = ImGui.GetColorU32(state.map_border_color[1], state.map_border_color[2], state.map_border_color[3], state.map_border_color[4])
-            -- local map_start_pos = ImVec2.new(cursor_x, cursor_y)
-            -- local map_end_pos = ImVec2.new(cursor_x + scaled_mini_map_width, cursor_y + scaled_mini_map_height)
-            -- draw_list:AddRect(map_start_pos, map_end_pos, line_color, 0, 0, state.map_border_thickness)
-            -- ImGui.SetCursorPos(cursor_x, cursor_y)
-        end
-
-        -- Calculate map texture size based on zoom
-        local zoomed_map_texture_width = state.map_texture_width * state.map_zoom
-        local zoomed_map_texture_height = state.map_texture_height * state.map_zoom
-
-        -- Calculate scaling factors
-        local world_to_map_texture_scale_factor_x = zoomed_map_texture_width / state.world_width
-        local world_to_map_texture_scale_factor_z = zoomed_map_texture_height / state.world_height
-
-        -- Get the player's coordinates in the world
-        local player_coordinates = Player.GetCoordinates()
-
-        -- This one is harder to explain... but if there are discrepencies between the image and the 
-        -- world in terms of origin point, we have to apply an offset to fix it.
-        -- Currently not in use, but keeping it here just in case I want to add the feature back in
-        -- to offset the map ever.
-        local zoomed_map_texture_offset_x = 0
-        local zoomed_map_texture_offset_y = 0
-
-        -- Convert the player's world coordinates to map texture coordinates
-        local player_map_texture_x = player_coordinates.x * world_to_map_texture_scale_factor_x - zoomed_map_texture_offset_x
-        local player_map_texture_z = player_coordinates.z * world_to_map_texture_scale_factor_z - zoomed_map_texture_offset_y
-
-        -- Calculate the portion of the map to display, centering around the player
-        local half_mini_map_width = scaled_mini_map_width / 2
-        local half_mini_map_height = scaled_mini_map_height / 2
-        local map_clip_x_start = player_map_texture_x - half_mini_map_width
-        local map_clip_y_start = player_map_texture_z - half_mini_map_height
-
-        -- Calculate UV coordinates for the map texture
-        local uv0_x = map_clip_x_start / zoomed_map_texture_width
-        local uv0_y = map_clip_y_start / zoomed_map_texture_height
-        local uv1_x = (map_clip_x_start + scaled_mini_map_width) / zoomed_map_texture_width
-        local uv1_y = (map_clip_y_start + scaled_mini_map_height) / zoomed_map_texture_height
-
-        -- Render the map image within the mini map
-        local map_tint = ImVec4.new(state.map_texture_tint[1], state.map_texture_tint[2], state.map_texture_tint[3], state.map_texture_tint[4])
-        ImGui.SetCursorPos(cursor_x, cursor_y)
-        ImGui.Image(state.map_texture, ImVec2.new(scaled_mini_map_width, scaled_mini_map_height),
-                    ImVec2.new(uv0_x, uv0_y), ImVec2.new(uv1_x, uv1_y), map_tint, state.default_texture_border_color)
-
-        
-        -- Render entities
-        ImGui.SetCursorPos(cursor_x, cursor_y)
-        local window_pos = {}
-        window_pos.x, window_pos.y = ImGui.GetCursorScreenPos()
-
-        local mini_map_center = ImVec2.new(window_pos.x + half_mini_map_width, window_pos.y + half_mini_map_height)
-        local entity_list = EntityList.GetAllEntities()
-
-        if state.show_entities == true then
-            local default_border_color = ImGui.GetColorU32(
-                state.entity_border_color[1],
-                state.entity_border_color[2],
-                state.entity_border_color[3],
-                state.entity_border_color[4]
-            )
-
-            local tracking_enabled = (state.entity_tracking_enabled == true and state.tracked_entities_by_key ~= nil)
-            local line_color = ImGui.GetColorU32(1, 1, 1, 0.75)
-
-            local ping_phase = nil
-            if tracking_enabled and state.ping_tracked_entities == true then
-                local ping_period = 1.5
-                local ping_duration = 0.35
-                local ping_t = ImGui.GetTime() % ping_period
-                if ping_t <= ping_duration then
-                    ping_phase = ping_t / ping_duration
-                end
-            end
-
-            local ping_color = nil
-            if ping_phase ~= nil then
-                ping_color = ImGui.GetColorU32(1, 1, 1, 1.0 - ping_phase)
-            end
-
-            ImGui.PushClipRect(window_pos.x, window_pos.y, window_pos.x + scaled_mini_map_width, window_pos.y + scaled_mini_map_height, true)
-            -- EntityList.GetAllEntities() always includes the player in slot 1.
-            for entity_index = 2, #entity_list do
-                local entity = entity_list[entity_index]
-
-                -- Entity objects read live memory on every property access, so
-                -- capture each field once per frame instead of re-reading it
-                -- at every use below.
-                local entity_id = entity:GetId()
-                local entity_name = entity:GetName()
-                local entity_level = entity:GetLevel()
-                local entity_x, entity_y, entity_z = entity:GetPosition()
-
-                -- When entities despawn, memory can transiently contain "empty slot" data.
-                -- Skip obviously-invalid entries to avoid rendering artifacts and tooltip issues.
-                if entity_id ~= 0 and entity_name ~= "" then
-                    -- Calculate the entity's position on the mini-map
-                    local entity_map_x = entity_x * world_to_map_texture_scale_factor_x
-                    local entity_map_z = entity_z * world_to_map_texture_scale_factor_z
-                    local distance = {x = entity_map_x - player_map_texture_x, z = entity_map_z - player_map_texture_z }
-                    local circle_center = ImVec2.new(mini_map_center.x + distance.x, mini_map_center.y + distance.z)
-
-                local player_level = Player.GetLevel()
-                local fill_color_u32 = state.entity_white_color
-                if      entity_level - 2    >   player_level then fill_color_u32 = state.entity_red_color
-                elseif  entity_level - 1    >=  player_level then fill_color_u32 = state.entity_yellow_color
-                elseif  entity_level        ==  player_level then fill_color_u32 = state.entity_white_color
-                elseif  entity_level + 1    ==  player_level then fill_color_u32 = state.entity_dark_blue_color
-                elseif  entity_level + 2    ==  player_level then fill_color_u32 = state.entity_light_blue_color
-                elseif  entity_level + 5    <=  player_level then fill_color_u32 = state.entity_gray_color
-                elseif  entity_level + 3    <=  player_level then fill_color_u32 = state.entity_green_color
-                end
-
-                local is_tracked = false
-                local tracked_border_color = default_border_color
-                if tracking_enabled then
-                    local tracked_index = state.tracked_entities_by_key[NormalizeEntityName(entity_name)]
-                    if tracked_index ~= nil then
-                        local tracked_entry = state.tracked_entities[tracked_index]
-                        if tracked_entry ~= nil and tracked_entry.enabled ~= false then
-                            is_tracked = true
-                            fill_color_u32 = ImGui.GetColorU32(
-                                tracked_entry.fill_color[1],
-                                tracked_entry.fill_color[2],
-                                tracked_entry.fill_color[3],
-                                tracked_entry.fill_color[4]
-                            )
-                            tracked_border_color = ImGui.GetColorU32(
-                                tracked_entry.border_color[1],
-                                tracked_entry.border_color[2],
-                                tracked_entry.border_color[3],
-                                tracked_entry.border_color[4]
-                            )
-                        end
-                    end
-                end
-
-                if is_tracked and state.line_to_tracked_entities == true then
-                    draw_list:AddLine(mini_map_center, circle_center, line_color, 1.0)
-                end
-
-                draw_list:AddCircleFilled(circle_center, state.entity_radius, fill_color_u32)
-
-                if state.show_entity_border == true or is_tracked then
-                    draw_list:AddCircle(circle_center, state.entity_radius, (is_tracked and tracked_border_color or default_border_color), 0, state.entity_border_thickness)
-                end
-
-                if is_tracked and ping_color ~= nil then
-                    local ping_radius = state.entity_radius + 4 + (ping_phase * 18)
-                    draw_list:AddCircle(circle_center, ping_radius, ping_color, 0, 2.0)
-                end
-
-                -- Render a tooltip when mousing over an entity
-                local mouse_x, mouse_y = ImGui.GetMousePos()
-                    local distance_squared = (mouse_x - circle_center.x)^2 + (mouse_y - circle_center.y)^2
-                    if distance_squared <= state.entity_radius^2 then
-                        ImGui.BeginTooltip()
-                        -- ImGui.Text() is printf-style: treat entity names as untrusted and render unformatted.
-                        ImGui.TextUnformatted(entity_name .. "(" .. entity_level .. ")\n" ..
-                                "ID: " .. entity_id .. "\n" ..
-                                string.format("Coordinates: %.2f, %.2f, %.2f", entity_x, entity_y, entity_z))
-                        ImGui.EndTooltip()
-                    end
-                end
-            end
-            ImGui.PopClipRect()
-        end
-
-        -- Render player
-        ImGui.SetCursorPos(cursor_x, cursor_y)
-        local player_indicator_dimensions = ImVec2.new(state.player_indicator_width * state.player_indicator_scale, state.player_indicator_height * state.player_indicator_scale)
-        if state.show_player_indicator_border then
-            local angle_of_texture_orientation = (math.pi / 2) -- The arrow is pointing up, so we need to account for that when drawing it
-            DrawRotatedImage(state.player_indicator_border_texture, mini_map_center, player_indicator_dimensions, angle_of_texture_orientation, Util.GetCompassRadians(), state.player_indicator_border_color)
-        end
-
-        if state.show_player_indicator_fill then
-            local angle_of_texture_orientation = (math.pi / 2) -- The arrow is pointing up, so we need to account for that when drawing it
-            DrawRotatedImage(state.player_indicator_fill_texture, mini_map_center, player_indicator_dimensions, angle_of_texture_orientation, Util.GetCompassRadians(), state.player_indicator_fill_color)
-        end
-
-        -- Uncomment this if you want to see an extra debug window
-        -- if ImGui.Begin("mini_map debug") then
-        --     ImGui.Text("World Dimensions:               " .. state.world_width .. " x " .. state.world_height)
-        --     ImGui.Text("World Center Coord:             " .. tostring(state.world_width / 2) .. ", " .. tostring(state.world_height / 2))
-        --     ImGui.Text("World to map scale factor x:    " .. tostring(world_to_map_texture_scale_factor_x))
-        --     ImGui.Text("World to map scale factor y:    " .. tostring(world_to_map_texture_scale_factor_z))
-        --     ImGui.Spacing()
-        --     ImGui.Text("Player World Coords:            " .. tostring(player_coordinates.x) .. ", " .. tostring(player_coordinates.z))
-        --     ImGui.Text("Player Map Coords:              " .. tostring(player_map_texture_x) .. ", " .. tostring(player_map_texture_z))
-        --     ImGui.Spacing()
-        --     ImGui.Text("Map Texture Center Coord:       " .. tostring(zoomed_map_texture_width / 2) .. ", " .. tostring(zoomed_map_texture_height / 2))
-        --     ImGui.Text("Map Clip Coords:                " .. tostring(map_clip_x_start) .. ", " .. tostring(map_clip_y_start))
-        --     ImGui.Text("UV0:                            " .. tostring(uv0_x) .. ", " .. tostring(uv0_y))
-        --     ImGui.Text("UV1:                            " .. tostring(uv1_x) .. ", " .. tostring(uv1_y))
-        --     ImGui.Text("UV0 Coords:                     " .. tostring(zoomed_map_texture_width * uv0_x) .. ", " .. tostring(zoomed_map_texture_height * uv0_y))
-        --     ImGui.Text("UV1 Coords:                     " .. tostring(zoomed_map_texture_width * uv1_x) .. ", " .. tostring(zoomed_map_texture_height * uv1_y))
-        --     ImGui.Spacing()
-        --     ImGui.Text("Mini Map Dimensions:            " .. tostring(scaled_mini_map_width) .. " x " .. tostring(scaled_mini_map_height))
-        --     ImGui.Text("Half Mini Map Dimensions:       " .. tostring(half_mini_map_width) .. " x " .. tostring(half_mini_map_height))
-        --     for _, entity in pairs(entity_list) do
-        --         -- Display the tree node with the entity name and ID
-        --         if ImGui.TreeNode(entity.name .. " (ID: " .. entity.id .. ")") then
-        --             -- Inside the tree node, show the entity stats
-        --             ImGui.Text("Name: " .. entity.name)
-        --             ImGui.Text("ID: " .. entity.id)
-        --             ImGui.Text("Level: " .. entity.level)
-        --             ImGui.Text("HP: " .. entity.percent_hp .. "%")
-        --             ImGui.Text(string.format("Coordinates: x = %.2f, y = %.2f, z = %.2f", entity.x, entity.y, entity.z))
-        --             -- End the tree node
-        --             ImGui.TreePop()
-        --         end
-        --     end
-        -- end
-        -- ImGui.End()
-        -- Additional logic for rendering entities can be added here...
-    end
-    ImGui.End()
-end
-
-
-
--- Creating a local variable to interact with the global table so that the name is shorter/easier to use
-local state = mini_map_state
 
 if state.initialized == false then Initialize() end
-
 if state.settings_registered == false then RegisterSettings() end
-
 if state.initialized then Render() end

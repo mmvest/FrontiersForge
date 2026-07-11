@@ -1,9 +1,12 @@
 local Util = require("frontiers_forge.util")
 local AbilityList = require("frontiers_forge.ability_list")
+local Item = require("frontiers_forge.item")
 local ffi = require("ffi")
 
--- Note that source_index is the RAW index into the ability list's record array.
--- Index 0 is the list's null sentinel, so real abilities are always index >= 1.
+-- Note that source_index is the RAW index into the source container. For the
+-- ability list, index 0 is the list's null sentinel, so real abilities are
+-- always index >= 1. For item slots it is a zero based index into the item
+-- record array.
 ffi.cdef[[
     typedef struct {
         int32_t  unknown_00;        // +0x00  always -1
@@ -13,12 +16,20 @@ ffi.cdef[[
         int32_t  unknown_0C;        // +0x0C  always -1
         int32_t  unknown_10;        // +0x10  always -1
         uint32_t unknown_14;        // +0x14  always 0
-        uint32_t source_type;       // +0x18  type tag: 0x8060000 = ability list, 0x2030000 = different container, 0 = empty
-        uint32_t source_index;      // +0x1C  raw index into the ability list array
+        uint32_t source_type;       // +0x18  type tag: 0x8060000 = ability list, 0x2030000 = item records, 0 = empty
+        uint32_t source_index;      // +0x1C  raw index into the source container
     } AbilityBarSlot;
 ]]
 
 local ABILITY_SOURCE_TAG = 0x8060000
+local ITEM_SOURCE_TAG    = 0x2030000
+
+-- Item slots index the player's item record array, the same records the
+-- inventory reads. UI_GetSlotSourceName (0x6266e8) resolves them as
+-- singleton + 0xC428 + 8 + index * 0x2FC.
+local ITEM_RECORDS_BASE = 0x1FAF730 + 0xC428 + 8
+local ITEM_RECORD_STRIDE = 0x2FC
+local MAX_ITEM_RECORDS = 40
 
 local AbilityBarSlot = {}
 AbilityBarSlot.__index = AbilityBarSlot
@@ -57,6 +68,31 @@ function AbilityBarSlot:GetAbility()
         return AbilityList.GetAbilityByIndex(ability_index)
     end
     return nil
+end
+
+--- Raw item record index this slot points at.
+--- @return integer|nil index Zero based index into the item records, or nil when the slot is not item sourced.
+function AbilityBarSlot:GetItemIndex()
+    if self.ptr.source_type ~= ITEM_SOURCE_TAG then
+        return nil
+    end
+    return self.ptr.source_index
+end
+
+--- Resolves the slot into a full Item object, for the item hotbar's slots.
+--- @return table|nil item Item object for this slot, or nil when the slot is empty or not item sourced.
+function AbilityBarSlot:GetItem()
+    local item_index = self:GetItemIndex()
+    if item_index == nil or item_index >= MAX_ITEM_RECORDS then
+        return nil
+    end
+    local record = ITEM_RECORDS_BASE + item_index * ITEM_RECORD_STRIDE
+    -- An empty record has slot id 0, so a stale index resolves to nothing
+    -- rather than to a blank item.
+    if Item.GetSlotId(record) == 0 then
+        return nil
+    end
+    return Item.new(record)
 end
 
 --- @return integer icon_ref Icon reference drawn in this slot, or -1 when empty.
@@ -229,6 +265,19 @@ function AbilityBar.GetAbility(bar_index, slot_index)
         return nil
     end
     return slot:GetAbility()
+end
+
+--- Convenience wrapper resolving a bar slot straight to an Item object, for the
+--- item hotbar's slots.
+--- @param bar_index integer Bar index from 0 to AbilityBar.num_bars - 1.
+--- @param slot_index integer Slot index from 0 to GetSlotCount(bar_index) - 1.
+--- @return table|nil item Item object, or nil when the slot is empty, not item sourced, or the UI is not loaded.
+function AbilityBar.GetItem(bar_index, slot_index)
+    local slot = AbilityBar.GetAbilitySlot(bar_index, slot_index)
+    if slot == nil then
+        return nil
+    end
+    return slot:GetItem()
 end
 
 return AbilityBar

@@ -74,7 +74,7 @@ This writes `releases/FrontiersForge-v1.2.3.zip`.
 | Script | Description |
 |--------|-------------|
 | [`ff_example.lua`](scripts/ff_example.lua) | A living demo of nearly every module and function FrontiersForge provides. Start here to see how the API is used. |
-| [`mini_map.lua`](scripts/mini_map.lua) | A configurable minimap showing nearby entities, with per-map settings, waypoints, and entity filtering. |
+| [`mini_map.lua`](scripts/mini_map.lua) | A live top-down minimap rendered from the game's real world geometry, read straight out of game memory as zones stream in. Textured mode samples the world's actual textures, so a town shows its roofs and streets from above, and flat mode shades by height instead. Height aware, so caves and dungeons render their actual layout instead of the overworld above, and the ceiling cut can follow you automatically, dropping under a real roof indoors and lifting away under open sky. Zoom, rotation, height slicing, and an entity overlay with tracked entity highlighting, pings, and lines, kept in shareable `.entl` lists. |
 | [`retro_health_hearts.lua`](scripts/retro_health_hearts.lua) | Displays player health as a row of retro-style hearts. |
 
 ## Modules
@@ -104,6 +104,9 @@ The EQOA modules live in `scripts/modules/frontiers_forge` and are loaded with `
 | `quest_log.lua` | The quest log list. Count and lookup by index. |
 | `ui.lua` | Toggles built-in HUD elements (ability bar, chat, health bar, etc.) and draws game UI art like disposition icons. |
 | `util.lua` | Low-level helpers. EE memory reads and writes, pointer chain resolution, guest pointer validation, string conversion, distance between world points, and experience tables. |
+| `world_geometry.lua` | Walks the live scene graph in EE memory (zones, rooms, sprites, render prim buffers) and yields the world geometry streamed in around the player as textured triangles. Used by `mini_map.lua`. |
+| `surface.lua` | Decodes VISurface textures (CLUT4, CLUT8, RGBA32, RGB16) out of EE memory into RGBA buffers, resolved by raster handle or material palette entry and cached. Used by `world_geometry.lua` and `map_render.lua`. |
+| `map_render.lua` | Incremental top-down rasterizer: height z-buffer, ceiling cut for cave/dungeon views, textured sampling with vertex color modulation, and a flat height-shaded mode. Used by `mini_map.lua`. |
 
 Two additional module folders are type-hint stubs for your editor, `scripts/modules/imgui/imgui.lua` and `scripts/modules/uiforge/uiforge.lua`. They enable intellisense for the ImGui and UiForge bindings. DO NOT `require` these in your scripts, that will break your Lua environment.
 

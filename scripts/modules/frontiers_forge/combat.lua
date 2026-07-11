@@ -8,7 +8,9 @@ local bit = require("bit")
 -- the dispatcher case and copy every event into a ring buffer Lua polls. The
 -- patch site is resolved from the VIWndGame overlay slide and verified against an
 -- exact instruction signature (with a scan fallback) before any write, and
--- uninstalling restores the original instruction then zeroes the cave.
+-- uninstalling restores the original instruction then zeroes the cave. When the
+-- Sandstorm patch already hooks the site, we chain onto the displaced
+-- instruction inside its cave instead, so both game versions are supported.
 
 local Combat = {}
 
@@ -27,6 +29,14 @@ local SITE_SIGNATURE = {
     0x8FA608E0, -- _lw a2,0x8E0(sp)  (amount)
 }
 local ORIGINAL_OPCODE = SITE_SIGNATURE[1]
+
+-- The Sandstorm patch hooks this same dispatcher case, replacing the first two
+-- signature words with a jal into its own cave plus a nop. Its cave re-executes
+-- both displaced loads right before its jr ra, so when we find a foreign jal at
+-- the site we follow it and patch the displaced lw a1 inside that cave instead.
+-- A plain j is used there rather than jal so the cave's ra stays intact, and the
+-- lw v0 that follows runs in our jump's delay slot.
+local FOREIGN_CAVE_SCAN_WORDS = 0x100
 
 -- Fallback signature-scan window
 local SCAN_START = 0x00300000
@@ -72,65 +82,120 @@ local function BuildCaveCode()
     }
 end
 
-local function SignatureMatchesAt(offset)
-    for i, word in ipairs(SITE_SIGNATURE) do
-        if Util.ReadFromOffset(offset + (i - 1) * 4, "uint32_t") ~= word then
-            return false
-        end
-    end
-    return true
+local JAL_CAVE = bit.bor(0x0C000000, bit.rshift(CAVE_CODE_OFFSET, 2))
+local J_CAVE   = bit.bor(0x08000000, bit.rshift(CAVE_CODE_OFFSET, 2))
+
+local function IsJal(word)
+    return bit.band(word, 0xFC000000) == 0x0C000000
 end
 
-local function ScanForSignature()
-    local mem = ffi.cast("uint32_t*", Util.EEmem() + SCAN_START)
-    local words = (SCAN_END - SCAN_START) / 4
-    local s1, s2, s3, s4 = SITE_SIGNATURE[1], SITE_SIGNATURE[2], SITE_SIGNATURE[3], SITE_SIGNATURE[4]
-    for i = 0, words - 4 do
-        if mem[i] == s1 and mem[i + 1] == s2 and mem[i + 2] == s3 and mem[i + 3] == s4 then
-            return SCAN_START + i * 4
+local function JalTarget(word)
+    -- The dispatcher and every cave sit below 0x10000000, so the pc-region bits are zero.
+    return bit.lshift(bit.band(word, 0x03FFFFFF), 2)
+end
+
+-- Follows a foreign jal at the site into its cave and finds the displaced
+-- lw a1 there (or our own j if a previous session already chained onto it).
+-- Returns the offset to patch and whether it is already ours.
+local function ResolveChainSite(jal_word)
+    local target = JalTarget(jal_word)
+    if target <= 0 or target >= 0x02000000 - FOREIGN_CAVE_SCAN_WORDS * 4 then
+        return nil
+    end
+    for i = 0, FOREIGN_CAVE_SCAN_WORDS - 1 do
+        local word = Util.ReadFromOffset(target + i * 4, "uint32_t")
+        if Util.ReadFromOffset(target + (i + 1) * 4, "uint32_t") == SITE_SIGNATURE[2] then
+            if word == ORIGINAL_OPCODE then
+                return target + i * 4, false
+            end
+            if word == J_CAVE then
+                return target + i * 4, true
+            end
         end
     end
     return nil
 end
 
--- Returns the offset of the patch site, or nil plus a reason.
--- Also succeeds when the site is already patched with our jal (second return
--- value true in that case).
+-- Classifies the four words at a candidate site. Returns the offset to patch,
+-- the opcode to patch it with, and whether it is already patched, or nil when
+-- the site does not look like the 0xDB dispatcher case at all.
+local function ClassifySite(site)
+    local w1 = Util.ReadFromOffset(site, "uint32_t")
+    local w3 = Util.ReadFromOffset(site + 8, "uint32_t")
+    local w4 = Util.ReadFromOffset(site + 12, "uint32_t")
+    if w3 ~= SITE_SIGNATURE[3] or w4 ~= SITE_SIGNATURE[4] then
+        return nil
+    end
+
+    if w1 == JAL_CAVE then
+        return site, JAL_CAVE, true
+    end
+    local w2 = Util.ReadFromOffset(site + 4, "uint32_t")
+    if w1 == ORIGINAL_OPCODE and w2 == SITE_SIGNATURE[2] then
+        return site, JAL_CAVE, false
+    end
+
+    -- A foreign hook (the Sandstorm patch) owns the site, so chain onto the
+    -- displaced instruction inside its cave.
+    if IsJal(w1) and w2 == 0 then
+        local chain, already = ResolveChainSite(w1)
+        if chain ~= nil then
+            return chain, J_CAVE, already
+        end
+    end
+    return nil
+end
+
+local function ScanForSite()
+    local mem = ffi.cast("uint32_t*", Util.EEmem() + SCAN_START)
+    local words = (SCAN_END - SCAN_START) / 4
+    local s3, s4 = SITE_SIGNATURE[3], SITE_SIGNATURE[4]
+    for i = 0, words - 4 do
+        if mem[i + 2] == s3 and mem[i + 3] == s4 then
+            local site, opcode, already = ClassifySite(SCAN_START + i * 4)
+            if site ~= nil then
+                return site, opcode, already
+            end
+        end
+    end
+    return nil
+end
+
+-- Returns the offset to patch (the dispatcher site itself, or the displaced
+-- instruction inside a foreign hook's cave), the opcode to write there, and
+-- whether it already holds our patch, or nil plus a reason.
 local function ResolvePatchSite()
     local draw_ptr_offset = Util.GetOffsetFromPointerChain(WND_GAME_STATIC_PTR, WND_GAME_DRAW_STEPS)
     if draw_ptr_offset == nil then
-        return nil, nil, "game UI not loaded (are you in game?)"
+        return nil, nil, nil, "game UI not loaded (are you in game?)"
     end
     local draw_runtime = Util.ReadFromOffset(draw_ptr_offset, "uint32_t")
     if draw_runtime == 0 or draw_runtime >= 0x02000000 then
-        return nil, nil, "bad draw-function pointer"
+        return nil, nil, nil, "bad draw-function pointer"
     end
 
     local slide = draw_runtime - WND_GAME_DRAW_STATIC
     local site = PATCH_SITE_STATIC + slide
 
     if site > 0 and site < 0x02000000 - 0x10 then
-        local first = Util.ReadFromOffset(site, "uint32_t")
-        local expected_jal = bit.bor(0x0C000000, bit.rshift(CAVE_CODE_OFFSET, 2))
-        if first == expected_jal then
-            return site, true, nil
-        end
-        if SignatureMatchesAt(site) then
-            return site, false, nil
+        local resolved, opcode, already = ClassifySite(site)
+        if resolved ~= nil then
+            return resolved, opcode, already, nil
         end
     end
 
     -- Slide assumption failed so scan for the signature instead.
-    site = ScanForSignature()
-    if site ~= nil then
-        return site, false, nil
+    local resolved, opcode, already = ScanForSite()
+    if resolved ~= nil then
+        return resolved, opcode, already, nil
     end
-    return nil, nil, "0xDB dispatcher signature not found"
+    return nil, nil, nil, "0xDB dispatcher signature not found"
 end
 
 local hook_state = {
     installed = false,
     patch_site = nil,
+    patch_opcode = nil, -- jal at the dispatcher site, or j inside a foreign cave
     last_seq = 0,       -- next sequence number we have not yet returned
     dropped = 0,        -- events lost to ring overruns across all polls
 }
@@ -149,7 +214,7 @@ function Combat.InstallHook()
         return true
     end
 
-    local site, already_patched, err = ResolvePatchSite()
+    local site, opcode, already_patched, err = ResolvePatchSite()
     if site == nil then
         return false, "combat hook: " .. err
     end
@@ -179,12 +244,12 @@ function Combat.InstallHook()
     Util.WriteToOffset(BUF_OFFSET + 12, "uint32_t", 0)
 
     if not already_patched then
-        local jal_cave = bit.bor(0x0C000000, bit.rshift(CAVE_CODE_OFFSET, 2))
-        Util.WriteToOffset(site, "uint32_t", jal_cave)
+        Util.WriteToOffset(site, "uint32_t", opcode)
     end
 
     hook_state.installed = true
     hook_state.patch_site = site
+    hook_state.patch_opcode = opcode
     hook_state.last_seq = 0
     hook_state.dropped = 0
     return true
@@ -195,18 +260,20 @@ end
 --- @return boolean success True on success (including when there is nothing to clean up).
 function Combat.UninstallHook()
     local site = hook_state.patch_site
+    local opcode = hook_state.patch_opcode
     if site == nil then
         -- Maybe a previous session left the hook in place, so find it just in case.
-        local resolved, already_patched = ResolvePatchSite()
+        local resolved, found_opcode, already_patched = ResolvePatchSite()
         if resolved == nil or not already_patched then
             return true -- nothing to clean up
         end
         site = resolved
+        opcode = found_opcode
     end
 
-    -- Only restore if the site actually holds our patch.
-    local jal_cave = bit.bor(0x0C000000, bit.rshift(CAVE_CODE_OFFSET, 2))
-    if Util.ReadFromOffset(site, "uint32_t") == jal_cave then
+    -- Only restore if the site actually holds our patch. Both the dispatcher
+    -- site and the foreign cave's displaced slot originally hold the same word.
+    if Util.ReadFromOffset(site, "uint32_t") == opcode then
         Util.WriteToOffset(site, "uint32_t", ORIGINAL_OPCODE)
     end
 
@@ -217,6 +284,7 @@ function Combat.UninstallHook()
 
     hook_state.installed = false
     hook_state.patch_site = nil
+    hook_state.patch_opcode = nil
     hook_state.last_seq = 0
     return true
 end

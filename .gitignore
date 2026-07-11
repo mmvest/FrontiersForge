@@ -17,3 +17,15 @@ inject_log*
 # Ignore extra files produced by FF
 # .entl files are the entity list files produced by entity tracking
 *.entl
+
+# Ignore any "test" directories
+**/test/
+**/tests/
+
+# Ignore profile directories created when I save a profile while playing.
+scripts/profiles/
+
+# yeahhh I made an experimental mod for an up-to-60-person party/raid group interface that tracked dps across
+# the party and such. It is pretty cool but seemed like no one would really use it (let alone 60 people).
+# If anyone is interested in this, message me or make a request on github.
+scripts/eqoa_tools/

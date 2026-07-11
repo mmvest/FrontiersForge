@@ -596,9 +596,22 @@ local function DisplayAbilityBarFunctions()
                         -- Ability object (see the Ability accessors above), and is
                         -- also available as AbilityBar.GetAbility(bar, slot)
                         local ability = ability_slot:GetAbility()
+                        -- Item hotbar slots (the special items bar) resolve into
+                        -- Item objects instead, via AbilitySlot:GetItem() or
+                        -- AbilityBar.GetItem(bar, slot).
+                        local item = ability_slot:GetItem()
                         if ability then
                             if ImGui.TreeNode("AbilitySlot:GetAbility(): " .. ability:GetName()) then
                                 DisplayAbilityDetails(ability)
+                                ImGui.TreePop()
+                            end
+                        elseif item then
+                            if ImGui.TreeNode("AbilitySlot:GetItem(): " .. item:GetName()) then
+                                ImGui.Text("Item:GetName(): " .. item:GetName())
+                                ImGui.Text("Item:GetDescription(): " .. item:GetDescription())
+                                ImGui.Text("Item:GetAmount(): " .. tostring(item:GetAmount()))
+                                ImGui.Text("Item:GetLevelReq(): " .. tostring(item:GetLevelReq()))
+                                ImGui.Text("Item:GetEquippedStatus(): " .. item:GetEquippedStatus())
                                 ImGui.TreePop()
                             end
                         else

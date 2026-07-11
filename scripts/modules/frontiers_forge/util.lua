@@ -1,7 +1,9 @@
-local ffi = require("ffi")
+﻿local ffi = require("ffi")
 local bit = require("bit")
 
-ffi.cdef[[
+-- pcall because hot reload runs this cdef again, and LuaJIT refuses to
+-- redefine structs. The definitions are identical, so a failure is harmless.
+pcall(ffi.cdef, [[
     extern uintptr_t EEmem;
     int WideCharToMultiByte(
         unsigned int CodePage,
@@ -22,10 +24,6 @@ ffi.cdef[[
         wchar_t* lpWideCharStr,
         int cchWideChar
     );
-
-    enum {
-        CP_UTF8 = 65001
-    };
 
     typedef void* HANDLE;
     typedef unsigned long DWORD;
@@ -52,7 +50,9 @@ ffi.cdef[[
     HANDLE FindFirstFileW(const wchar_t* lpFileName, WIN32_FIND_DATAW* lpFindFileData);
     BOOL FindNextFileW(HANDLE hFindFile, WIN32_FIND_DATAW* lpFindFileData);
     BOOL FindClose(HANDLE hFindFile);
-]]
+]])
+
+local CP_UTF8 = 65001
 
 
 -- Define experience needed for each level
@@ -177,7 +177,7 @@ end
 function Util.utf16_to_utf8(utf16_ptr)
     -- Calculate the required buffer size for the UTF-8 string
     local utf8_len = ffi.C.WideCharToMultiByte(
-        ffi.C.CP_UTF8, 0,
+        CP_UTF8, 0,
         utf16_ptr, -1,
         nil, 0,
         nil, nil
@@ -192,7 +192,7 @@ function Util.utf16_to_utf8(utf16_ptr)
 
     -- Perform the conversion
     ffi.C.WideCharToMultiByte(
-        ffi.C.CP_UTF8, 0,
+        CP_UTF8, 0,
         utf16_ptr, -1,
         utf8_str, utf8_len,
         nil, nil
@@ -210,7 +210,7 @@ function Util.utf8_to_utf16(utf8_str)
     utf8_str = tostring(utf8_str or "")
 
     local wide_len = ffi.C.MultiByteToWideChar(
-        ffi.C.CP_UTF8, 0,
+        CP_UTF8, 0,
         utf8_str, -1,
         nil, 0
     )
@@ -221,7 +221,7 @@ function Util.utf8_to_utf16(utf8_str)
 
     local wide_buf = ffi.new("wchar_t[?]", wide_len)
     local written = ffi.C.MultiByteToWideChar(
-        ffi.C.CP_UTF8, 0,
+        CP_UTF8, 0,
         utf8_str, -1,
         wide_buf, wide_len
     )
@@ -293,17 +293,59 @@ function Util.IsBattleMusicPlaying()
     return Util.ReadFromOffset(player_entity + 0x263, "uint8_t") ~= 0
 end
 
---- Retrieve the player's compass heading in radians.
---- @return number radians Compass heading in radians.
+--- Retrieve the game's raw facing angle in radians.
+--- The raw angle turns opposite to compass degrees, facing at raw angle h
+--- points along the world direction (-sin h, -cos h) on the x z plane, so
+--- raw east is 270. Use GetCompassDegrees for a real compass reading.
+--- @return number radians Raw facing angle in radians.
 function Util.GetCompassRadians()
     local compass_heading_offset = 0x1FB66AC
     return Util.ReadFromOffset(compass_heading_offset, "float")
 end
 
---- Convenience wrapper to get compass heading in degrees.
---- @return number degrees Compass heading in degrees.
+--- The compass heading in degrees, north 0, east 90, clockwise.
+--- @return number degrees Compass heading in [0, 360).
 function Util.GetCompassDegrees()
-    return Util.RadiansToDegrees(Util.GetCompassRadians())
+    return (360 - Util.RadiansToDegrees(Util.GetCompassRadians() or 0)) % 360
+end
+
+--- Wraps an angle into [0, 360).
+--- @param degrees number
+--- @return number degrees
+function Util.NormalizeDegrees(degrees)
+    return degrees % 360
+end
+
+--- Shortest signed difference between two angles, in degrees.
+--- @param from_deg number
+--- @param to_deg number
+--- @return number difference In [-180, 180). Positive means to_deg is ahead of from_deg.
+function Util.SignedDegreesBetween(from_deg, to_deg)
+    return (to_deg - from_deg + 180) % 360 - 180
+end
+
+--- Compass bearing from one world point toward another, in the same convention
+--- Util.GetCompassRadians uses. Facing at heading h points along the world
+--- direction (sin h, -cos h) on the x z plane, so the bearing of a direction
+--- (dx, dz) is atan2(dx, -dz). Verified in game. Height is ignored.
+--- @param from table Point with x and z fields.
+--- @param to table Point with x and z fields.
+--- @return number degrees Bearing in [0, 360).
+function Util.GetBearingToPoint(from, to)
+    local dx = to.x - from.x
+    local dz = to.z - from.z
+    return Util.NormalizeDegrees(Util.RadiansToDegrees(math.atan2(dx, -dz)))
+end
+
+--- Whether a heading is pointed at a world point, within a tolerance.
+--- @param from table Viewer position with x and z fields.
+--- @param heading_deg number Compass heading, degrees.
+--- @param point table Target point with x and z fields.
+--- @param tolerance_deg number|nil Half angle of the acceptance cone, default 10.
+--- @return boolean facing
+function Util.IsFacingPoint(from, heading_deg, point, tolerance_deg)
+    local offset = Util.SignedDegreesBetween(heading_deg, Util.GetBearingToPoint(from, point))
+    return math.abs(offset) <= (tolerance_deg or 10)
 end
 
 --- Lists files matching a Windows wildcard pattern. Directories are skipped.
