@@ -1,6 +1,6 @@
 local ffi     = require("ffi")
 local bit     = require("bit")
-local Surface = require("frontiers_forge.surface")
+local Surface = require("surface")
 
 -- Top-down map rasterizer used by mini_map.lua. Renders world triangles into
 -- an RGBA texture, z-buffered by height, with a "ceiling cut" that removes

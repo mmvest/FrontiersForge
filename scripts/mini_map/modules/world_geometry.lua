@@ -1,6 +1,6 @@
 local ffi     = require("ffi")
 local Util    = require("frontiers_forge.util")
-local Surface = require("frontiers_forge.surface")
+local Surface = require("surface")
 
 -- Walks the game's live scene in EE memory and yields the world geometry
 -- currently streamed in around the player, as textured triangles.

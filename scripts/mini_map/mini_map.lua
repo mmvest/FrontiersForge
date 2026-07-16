@@ -26,8 +26,8 @@ local UI            = require("frontiers_forge.ui")
 local Player        = require("frontiers_forge.player")
 local Util          = require("frontiers_forge.util")
 local EntityList    = require("frontiers_forge.entity_list")
-local WorldGeometry = require("frontiers_forge.world_geometry")
-local MapRender     = require("frontiers_forge.map_render")
+local WorldGeometry = require("world_geometry")
+local MapRender     = require("map_render")
 
 -- The cut height used under open sky. Nothing in the world reaches this, so the
 -- whole scene, mountain tops included, survives the cut.
