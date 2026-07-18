@@ -339,7 +339,7 @@ local function DisplayAbilityDetails(ability)
     ImGui.PushTextWrapPos(0.0)
     ImGui.Text("GetDescription: " .. ability:GetDescription())
     ImGui.PopTextWrapPos()
-    ImGui.Text("GetCategory: " .. ability:GetCategory())
+    ImGui.Text("GetDisplayIndex: " .. ability:GetDisplayIndex())
     ImGui.Text("GetSpellbookSlot: " .. ability:GetSpellbookSlot())
     ImGui.Text("GetLevel: " .. ability:GetLevel())
     ImGui.Text(string.format("GetRange: %.2f", ability:GetRange()))
@@ -768,7 +768,64 @@ ff_combat_meter = ff_combat_meter or {
     hits_dealt = 0,
     hits_taken = 0,
     log = {},
+    subscribed = false,
+    last_damage_ms = 0,
 }
+
+-- Combat reports individual events, it does not decide when a fight starts or
+-- ends. That is deliberate, since the right answer depends on the mod: how long
+-- a lull ends a fight, and whether healing should hold one open. Deriving it is
+-- a few lines, and this is what they look like.
+local IDLE_TIMEOUT_MS = 5000
+
+-- Combat.lua owns the hook and publishes what it captures, so a mod subscribes to
+-- the events it cares about instead of draining the ring itself. Several mods
+-- can watch the same events this way.
+local COMBAT_OWNER = "ff_example"
+
+local function SubscribeToCombatEvents()
+    local meter = ff_combat_meter
+
+    local function Log(event, label)
+        meter.log[#meter.log + 1] = string.format(
+            "#%d  %s  attacker=%d  defender=%d  amount=%d",
+            event.seq, label, event.attacker_id, event.defender_id, event.amount)
+        while #meter.log > 20 do
+            table.remove(meter.log, 1)
+        end
+    end
+
+    Combat.On(COMBAT_OWNER, Combat.Events.OnDamageDealt, function(event)
+        meter.damage_dealt = meter.damage_dealt + math.abs(event.amount)
+        meter.hits_dealt = meter.hits_dealt + 1
+        -- Damage is what this mod counts as fighting. Healing deliberately does
+        -- not, since healing up after a pull would hold the fight open.
+        meter.last_damage_ms = math.floor(ImGui.GetTime() * 1000)
+        Log(event, "dealt")
+    end)
+
+    Combat.On(COMBAT_OWNER, Combat.Events.OnDamageReceived, function(event)
+        meter.damage_taken = meter.damage_taken + math.abs(event.amount)
+        meter.hits_taken = meter.hits_taken + 1
+        meter.last_damage_ms = math.floor(ImGui.GetTime() * 1000)
+        Log(event, "taken")
+    end)
+
+    Combat.On(COMBAT_OWNER, Combat.Events.OnHealingReceived, function(event)
+        meter.healing_received = meter.healing_received + math.abs(event.amount)
+        Log(event, "healed")
+    end)
+
+    meter.subscribed = true
+end
+
+if not ff_combat_meter.subscribed then
+    SubscribeToCombatEvents()
+    UiForge.RegisterCallback(UiForge.CallbackType.DisableScript, function()
+        Combat.Off(COMBAT_OWNER)
+        Combat.Release(COMBAT_OWNER)
+    end)
+end
 
 -- Save and load demo using UiForge profiles. The Save callback returns a
 -- plain data table which UiForge captures into the profile when you use
@@ -813,31 +870,11 @@ local function DisplaySaveLoadFunctions()
 end
 
 local function DisplayCombatFunctions()
-    -- Poll every frame while the hook is up, even when the header is
-    -- collapsed, so the 64-entry ring buffer never overruns.
+    -- Driven every frame even when the header is collapsed, so the 64 entry
+    -- ring buffer never overruns. Any subscriber may drive it, a second call in
+    -- the same frame simply finds the ring already empty.
     local meter = ff_combat_meter
-    if Combat.IsHookInstalled() then
-        for _, event in ipairs(Combat.PollEvents()) do
-            if event.is_heal then
-                if event.incoming then
-                    meter.healing_received = meter.healing_received + event.amount
-                end
-            elseif event.outgoing then
-                meter.damage_dealt = meter.damage_dealt - event.amount
-                meter.hits_dealt = meter.hits_dealt + 1
-            elseif event.incoming then
-                meter.damage_taken = meter.damage_taken - event.amount
-                meter.hits_taken = meter.hits_taken + 1
-            end
-            meter.log[#meter.log + 1] = string.format(
-                "#%d  attacker=%d  defender=%d  amount=%d%s",
-                event.seq, event.attacker_id, event.defender_id, event.amount,
-                event.is_heal and "  (heal)" or "")
-            if #meter.log > 20 then
-                table.remove(meter.log, 1)
-            end
-        end
-    end
+    Combat.Update()
 
     if ImGui.CollapsingHeader("Combat Functions") then
         if Util.IsInGame() == 0 then
@@ -846,22 +883,32 @@ local function DisplayCombatFunctions()
         end
 
         ImGui.Text("Combat.IsHookInstalled(): " .. tostring(Combat.IsHookInstalled()))
-        if not Combat.IsHookInstalled() then
-            if ImGui.Button("Combat.InstallHook()") then
-                local ok, err = Combat.InstallHook()
+        ImGui.Text("Combat.GetOwnerCount(): " .. Combat.GetOwnerCount())
+        -- The hook is shared, so a mod claims and releases it rather than
+        -- installing and uninstalling. It comes up on the first claim and goes
+        -- away only once the last one is dropped.
+        if not Combat.HasClaim(COMBAT_OWNER) then
+            if ImGui.Button("Combat.Acquire()") then
+                local ok, err = Combat.Acquire(COMBAT_OWNER)
                 meter.last_error = ok and nil or err
             end
         else
-            if ImGui.Button("Combat.UninstallHook()") then
-                Combat.UninstallHook()
+            -- Releasing drops only this script's claim. The hook stays up if
+            -- another mod is still holding one.
+            if ImGui.Button("Combat.Release()") then
+                Combat.Release(COMBAT_OWNER)
             end
         end
         if meter.last_error then
-            ImGui.Text("install failed: " .. meter.last_error)
+            ImGui.Text("acquire failed: " .. meter.last_error)
         end
 
         ImGui.Text("Combat.GetEventCount(): " .. Combat.GetEventCount())
         ImGui.Text("Combat.GetDroppedCount(): " .. Combat.GetDroppedCount())
+        -- Derived here, not reported by Combat. See IDLE_TIMEOUT_MS above.
+        local idle_ms = math.floor(ImGui.GetTime() * 1000) - meter.last_damage_ms
+        local fighting = meter.last_damage_ms > 0 and idle_ms < IDLE_TIMEOUT_MS
+        ImGui.Text(string.format("Fighting (derived by this mod): %s", tostring(fighting)))
 
         ImGui.Text(string.format("Damage dealt: %d (%d hits)", meter.damage_dealt, meter.hits_dealt))
         ImGui.Text(string.format("Damage taken: %d (%d hits)", meter.damage_taken, meter.hits_taken))
@@ -873,7 +920,7 @@ local function DisplayCombatFunctions()
             meter.log = {}
         end
 
-        if ImGui.TreeNode("Recent events (Combat.PollEvents())") then
+        if ImGui.TreeNode("Recent events (subscribed)") then
             if #meter.log == 0 then
                 ImGui.Text("(no combat events captured yet)")
             end

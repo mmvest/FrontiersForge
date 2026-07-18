@@ -8,9 +8,9 @@ local Surface = require("surface")
 -- render instead of the terrain above them.
 --
 -- Two modes:
---   textured  samples the triangle's own texture through its UVs and modulates
---             it by the baked vertex color, so the map shows the world's real
---             art from above. The projection is orthographic, so interpolating
+--   textured  samples the triangle's own texture through its UVs, so the map
+--             shows the world's real art from above. The projection is
+--             orthographic, so interpolating
 --             UVs linearly in screen space is exact, no perspective divide.
 --   flat      shades by height alone. Shading is split into two gradients
 --             around the reference height (usually the player's y): floor_range
@@ -38,6 +38,45 @@ local ALPHA_TEST = Surface.ALPHA_TEST
 
 -- Textures decoded per Step call, so a zone change never stalls a frame.
 local TEX_PER_STEP = 3
+
+-- Builds a box-filtered mip chain above the decoded surface, so minified
+-- sampling averages texels instead of skipping them.
+local function BuildMips(surf)
+    local levels = { surf }
+    local src = surf
+    while src.w > 1 or src.h > 1 do
+        local nw = src.w > 1 and math.floor(src.w / 2) or 1
+        local nh = src.h > 1 and math.floor(src.h / 2) or 1
+        local dst = { w = nw, h = nh, pixels = ffi.new("uint32_t[?]", nw * nh) }
+        local sp, sw = src.pixels, src.w
+        local xstep = src.w > 1 and 1 or 0
+        local ystep = src.h > 1 and sw or 0
+        for y = 0, nh - 1 do
+            local row0 = (y * 2) * sw
+            for x = 0, nw - 1 do
+                local o = row0 + x * 2
+                local p0, p1 = sp[o], sp[o + xstep]
+                local p2, p3 = sp[o + ystep], sp[o + ystep + xstep]
+                local r = bit.band(p0, 0xFF) + bit.band(p1, 0xFF)
+                        + bit.band(p2, 0xFF) + bit.band(p3, 0xFF)
+                local g = bit.band(bit.rshift(p0, 8), 0xFF) + bit.band(bit.rshift(p1, 8), 0xFF)
+                        + bit.band(bit.rshift(p2, 8), 0xFF) + bit.band(bit.rshift(p3, 8), 0xFF)
+                local b = bit.band(bit.rshift(p0, 16), 0xFF) + bit.band(bit.rshift(p1, 16), 0xFF)
+                        + bit.band(bit.rshift(p2, 16), 0xFF) + bit.band(bit.rshift(p3, 16), 0xFF)
+                local a = bit.rshift(p0, 24) + bit.rshift(p1, 24)
+                        + bit.rshift(p2, 24) + bit.rshift(p3, 24)
+                dst.pixels[y * nw + x] = bit.bor(
+                    bit.rshift(r + 2, 2),
+                    bit.lshift(bit.rshift(g + 2, 2), 8),
+                    bit.lshift(bit.rshift(b + 2, 2), 16),
+                    bit.lshift(bit.rshift(a + 2, 2), 24))
+            end
+        end
+        levels[#levels + 1] = dst
+        src = dst
+    end
+    return levels
+end
 
 local function ColorU32FromTable(c)
     local r = math.floor(c[1] * 255 + 0.5)
@@ -88,31 +127,39 @@ end
 ---   floor_range         shade falloff below ref_y
 ---   above_range         shade falloff above ref_y
 ---   textured            sample real textures instead of the height palette
----   lighting            modulate texels by the world's baked vertex lighting.
----                       The engine relights those colors with the time of day,
----                       so at night this renders most of the map black
+---   supersample         raster at size * this, box-downsample on Upload (AA)
+---   sun                 shade each triangle by how much it faces upward
+---   lighting            add the world's baked static light (lava glow etc) on
+---                       top of a fixed ambient. Outdoor zones bake almost
+---                       none, so this mostly shows in dungeons
 ---   brightness          multiplies the sampled texels, 1.0 leaves them as is
 ---   colors              { low, mid, high, actor_tint, background } rgba tables
 --- Fill job.cells afterwards, then call Step until it returns true.
 function MapRender.Start(opts)
     local size = opts.size
+    local ss = opts.supersample or 1
+    if ss < 1 then ss = 1 end
+    local rsize = size * ss
     local job = {
         center_x = opts.center_x,
         center_z = opts.center_z,
         ref_y = opts.ref_y,
         cut_y = opts.cut_y,
         radius = opts.radius,
-        size = size,
+        size = rsize,
+        out_size = size,
+        supersample = ss,
         textured = opts.textured and true or false,
         lighting = opts.lighting and true or false,
+        sun = opts.sun and true or false,
         brightness = opts.brightness or 1.0,
         x0 = opts.center_x - opts.radius,
         z0 = opts.center_z - opts.radius,
-        pix_per_unit = size / (2 * opts.radius),
+        pix_per_unit = rsize / (2 * opts.radius),
         inv_floor = 1.0 / opts.floor_range,
         inv_above = 1.0 / opts.above_range,
-        fb = ffi.new("uint32_t[?]", size * size),
-        depth = ffi.new("float[?]", size * size),
+        fb = ffi.new("uint32_t[?]", rsize * rsize),
+        depth = ffi.new("float[?]", rsize * rsize),
         cells = {},
         cell_i = 1,
         tri_i = 0,
@@ -122,7 +169,8 @@ function MapRender.Start(opts)
         mat_surf = {},      -- material key -> decoded surface, this job only
     }
     local bg = ColorU32FromTable(opts.colors.background)
-    for i = 0, size * size - 1 do
+    job.bg = bg
+    for i = 0, rsize * rsize - 1 do
         job.fb[i] = bg
         job.depth[i] = -1e30
     end
@@ -156,7 +204,21 @@ local function Setup(job, ax, az, bx, bz, cx, cz)
     local d = (bz - cz) * (ax - cx) + (cx - bx) * (az - cz)
     if d > -1e-9 and d < 1e-9 then return nil end
 
-    return minx, maxx, minz, maxz, ax, az, bx, bz, cx, cz, 1.0 / d
+    return minx, maxx, minz, maxz, ax, az, bx, bz, cx, cz, 1.0 / d, d
+end
+
+-- Upward-facing factor of the triangle's plane, 1 flat ground, 0 vertical
+-- wall. Both windings count since PS2 strips draw double sided.
+local function UpFactor(t)
+    local e1x, e1y, e1z = t.x1 - t.x0, t.y1 - t.y0, t.z1 - t.z0
+    local e2x, e2y, e2z = t.x2 - t.x0, t.y2 - t.y0, t.z2 - t.z0
+    local nx = e1y * e2z - e1z * e2y
+    local ny = e1z * e2x - e1x * e2z
+    local nz = e1x * e2y - e1y * e2x
+    local len_sq = nx * nx + ny * ny + nz * nz
+    if len_sq < 1e-12 then return 1 end
+    local up = ny < 0 and -ny or ny
+    return up / math.sqrt(len_sq)
 end
 
 local function ShadeIndex(job, y)
@@ -210,35 +272,58 @@ local function RasterFlat(job, t)
     end
 end
 
---- Rasterizes one triangle by sampling its texture. Texels under the alpha test
+--- Rasterizes one triangle by sampling its texture bilinearly from the mip
+--- level closest to the triangle's texel density. Texels under the alpha test
 --- are left untouched.
-local function RasterTextured(job, t, surf)
+local function RasterTextured(job, t, levels)
     local cut_y = job.cut_y
     local ay, by, cy = t.y0, t.y1, t.y2
     local min_y = ay < by and ay or by
     if cy < min_y then min_y = cy end
     if min_y > cut_y then return end
 
-    local minx, maxx, minz, maxz, ax, az, bx, bz, cx, cz, inv_d =
+    local minx, maxx, minz, maxz, ax, az, bx, bz, cx, cz, inv_d, d =
         Setup(job, t.x0, t.z0, t.x1, t.z1, t.x2, t.z2)
     if minx == nil then return end
 
     local u0, v0, u1, v1, u2, v2 = t.u0, t.v0, t.u1, t.v1, t.u2, t.v2
-    local pixels, tw, th = surf.pixels, surf.w, surf.h
+
+    -- Texels this triangle spans per screen pixel picks the mip, halving the
+    -- speckle a point sample of a dense texture would leave.
+    local base = levels[1]
+    local uv_area = (u1 - u0) * (v2 - v0) - (u2 - u0) * (v1 - v0)
+    if uv_area < 0 then uv_area = -uv_area end
+    local texel_area = 0.5 * uv_area * base.w * base.h
+    local screen_area = 0.5 * (d < 0 and -d or d)
+    local level = 1
+    if screen_area > 1e-9 and texel_area > screen_area then
+        level = 1 + math.floor(0.5 * math.log(texel_area / screen_area) / 0.69314718 + 0.5)
+        if level > #levels then level = #levels end
+    end
+    local lv = levels[level]
+    local pixels, tw, th = lv.pixels, lv.w, lv.h
 
     local scale = job.brightness
     local mr, mg, mb = scale, scale, scale
-    if job.lighting then
-        local color = t.color
-        mr = mr * bit.band(color, 0xFF) / 255
-        mg = mg * bit.band(bit.rshift(color, 8), 0xFF) / 255
-        mb = mb * bit.band(bit.rshift(color, 16), 0xFF) / 255
+    if job.sun then
+        local shade = 0.45 + 0.65 * UpFactor(t)
+        if shade > 1.1 then shade = 1.1 end
+        mr, mg, mb = mr * shade, mg * shade, mb * shade
     end
-    local plain = mr > 0.99 and mr < 1.01 and mg > 0.99 and mg < 1.01
-                  and mb > 0.99 and mb < 1.01
-
+    if job.lighting then
+        -- Baked vertex colors are additive static light on top of the scene
+        -- ambient, not modulate factors. 0.5 stands in for daylight ambient.
+        local color = t.color
+        local lr = 0.5 + bit.band(color, 0xFF) / 128
+        local lg = 0.5 + bit.band(bit.rshift(color, 8), 0xFF) / 128
+        local lb = 0.5 + bit.band(bit.rshift(color, 16), 0xFF) / 128
+        mr = mr * (lr < 1.3 and lr or 1.3)
+        mg = mg * (lg < 1.3 and lg or 1.3)
+        mb = mb * (lb < 1.3 and lb or 1.3)
+    end
     local fb, depth, size = job.fb, job.depth, job.size
     local floor = math.floor
+    local band, rshift, lshift, bor = bit.band, bit.rshift, bit.lshift, bit.bor
 
     for pz_i = minz, maxz do
         local row = pz_i * size
@@ -256,26 +341,41 @@ local function RasterTextured(job, t, surf)
                         if y > depth[idx] then
                             local u = l1 * u0 + l2 * u1 + l3 * u2
                             local v = l1 * v0 + l2 * v1 + l3 * v2
-                            local tx = floor((u - floor(u)) * tw)
-                            local ty = floor((v - floor(v)) * th)
-                            if tx >= tw then tx = tw - 1 end
-                            if ty >= th then ty = th - 1 end
-                            local texel = pixels[ty * tw + tx]
-                            if bit.rshift(texel, 24) >= ALPHA_TEST then
+                            -- Bilinear with repeat wrap
+                            local fu = u * tw - 0.5
+                            local fv = v * th - 0.5
+                            local xi = floor(fu)
+                            local yi = floor(fv)
+                            local fx = fu - xi
+                            local fy = fv - yi
+                            local x0t = xi % tw
+                            local x1t = (xi + 1) % tw
+                            local y0t = (yi % th) * tw
+                            local y1t = ((yi + 1) % th) * tw
+                            local p00 = pixels[y0t + x0t]
+                            local p10 = pixels[y0t + x1t]
+                            local p01 = pixels[y1t + x0t]
+                            local p11 = pixels[y1t + x1t]
+                            local w00 = (1 - fx) * (1 - fy)
+                            local w10 = fx * (1 - fy)
+                            local w01 = (1 - fx) * fy
+                            local w11 = fx * fy
+                            local a = rshift(p00, 24) * w00 + rshift(p10, 24) * w10
+                                    + rshift(p01, 24) * w01 + rshift(p11, 24) * w11
+                            if a >= ALPHA_TEST then
+                                local r = (band(p00, 0xFF) * w00 + band(p10, 0xFF) * w10
+                                         + band(p01, 0xFF) * w01 + band(p11, 0xFF) * w11) * mr
+                                local g = (band(rshift(p00, 8), 0xFF) * w00 + band(rshift(p10, 8), 0xFF) * w10
+                                         + band(rshift(p01, 8), 0xFF) * w01 + band(rshift(p11, 8), 0xFF) * w11) * mg
+                                local b = (band(rshift(p00, 16), 0xFF) * w00 + band(rshift(p10, 16), 0xFF) * w10
+                                         + band(rshift(p01, 16), 0xFF) * w01 + band(rshift(p11, 16), 0xFF) * w11) * mb
+                                if r > 255 then r = 255 end
+                                if g > 255 then g = 255 end
+                                if b > 255 then b = 255 end
                                 depth[idx] = y
-                                if plain then
-                                    fb[idx] = bit.bor(texel, 0xFF000000)
-                                else
-                                    local r = bit.band(texel, 0xFF) * mr
-                                    local g = bit.band(bit.rshift(texel, 8), 0xFF) * mg
-                                    local b = bit.band(bit.rshift(texel, 16), 0xFF) * mb
-                                    if r > 255 then r = 255 end
-                                    if g > 255 then g = 255 end
-                                    if b > 255 then b = 255 end
-                                    fb[idx] = bit.bor(floor(r),
-                                        bit.lshift(floor(g), 8),
-                                        bit.lshift(floor(b), 16), 0xFF000000)
-                                end
+                                fb[idx] = bor(floor(r),
+                                    lshift(floor(g), 8),
+                                    lshift(floor(b), 16), 0xFF000000)
                             end
                         end
                     end
@@ -324,8 +424,8 @@ function MapRender.Step(job, budget)
         while job.surface_i <= #job.surfaces and decoded < TEX_PER_STEP do
             local key = job.surfaces[job.surface_i]
             local ok, surf = pcall(SurfaceFromKey, key)
-            if ok then
-                job.mat_surf[key] = surf
+            if ok and type(surf) == "table" then
+                job.mat_surf[key] = BuildMips(surf)
             end
             job.surface_i = job.surface_i + 1
             decoded = decoded + 1
@@ -368,10 +468,49 @@ function MapRender.Step(job, budget)
     return job.cells[job.cell_i] == nil
 end
 
---- Uploads the finished framebuffer as a texture. Caller owns the handle.
+--- Uploads the finished framebuffer as a texture, box-downsampling the
+--- supersampled raster first. The outer pixel ring is forced to the background
+--- color, so the GPU's clamp sampling shows background instead of a smear when
+--- the view slides past the texture between rebuilds. Caller owns the handle.
 function MapRender.Upload(job)
+    local out_size = job.out_size
+    local ss = job.supersample
+    local out = job.fb
+    if ss > 1 then
+        local rsize = job.size
+        local inv = 1 / (ss * ss)
+        out = ffi.new("uint32_t[?]", out_size * out_size)
+        for y = 0, out_size - 1 do
+            for x = 0, out_size - 1 do
+                local r, g, b, a = 0, 0, 0, 0
+                for sy = 0, ss - 1 do
+                    local row = (y * ss + sy) * rsize + x * ss
+                    for sx = 0, ss - 1 do
+                        local p = job.fb[row + sx]
+                        r = r + bit.band(p, 0xFF)
+                        g = g + bit.band(bit.rshift(p, 8), 0xFF)
+                        b = b + bit.band(bit.rshift(p, 16), 0xFF)
+                        a = a + bit.rshift(p, 24)
+                    end
+                end
+                out[y * out_size + x] = bit.bor(
+                    math.floor(r * inv + 0.5),
+                    bit.lshift(math.floor(g * inv + 0.5), 8),
+                    bit.lshift(math.floor(b * inv + 0.5), 16),
+                    bit.lshift(math.floor(a * inv + 0.5), 24))
+            end
+        end
+    end
+    local bg = job.bg
+    local last = out_size - 1
+    for i = 0, last do
+        out[i] = bg
+        out[last * out_size + i] = bg
+        out[i * out_size] = bg
+        out[i * out_size + last] = bg
+    end
     return UiForge.CreateTextureFromMemory(
-        ffi.string(job.fb, job.size * job.size * 4), job.size, job.size)
+        ffi.string(out, out_size * out_size * 4), out_size, out_size)
 end
 
 return MapRender

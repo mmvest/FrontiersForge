@@ -1,5 +1,6 @@
 local Util = require("frontiers_forge.util")
 local Icon = require("frontiers_forge.icon")
+local bit = require("bit")
 
 -- Base of the 9VIWndGame render code-block (compass, health, power, experience,
 -- target nameplate). Its draw calls all sit strictly between VIWindow_BeginDraw and
@@ -12,9 +13,12 @@ end
 
 -- This offset is the base of the UI Rendering code-block for 9VIWndChat window.
 -- This window handles the chat pop-up for typing, the players active effects (buffs),
--- the ability bar, and the chat window in the bottom right.
+-- the ability bar, and the chat window in the bottom right. The chat window is
+-- child slot +0x688 on the VIWndGame root, reached through the same stable chain
+-- as wnd_game_offset rather than the focused-window pointer, which retargets on
+-- focus changes (targeting, pause menu) and made these writes land elsewhere.
 local function wnd_chat_offset()
-    return Util.GetOffsetFromPointerChain(0x4E37F4, {0x14, 0x688, 0x20, 0x1C})
+    return Util.GetOffsetFromPointerChain(0x14E200, {0x190, 0x53C, 0x688, 0x20, 0x1C})
 end
 
 local NOP = 0x00000000
@@ -36,6 +40,15 @@ local HOTBAR_COMPACT_DISABLE_BRANCH  = 0x10000134
 local HOTBAR_EXPANDED_DISABLE_BRANCH = 0x10000104
 local ACTIVE_EFFECTS_DISABLE_BRANCH  = 0x1000005E
 
+-- Every branch-disabled element's original word is the BeginDraw call
+-- (jal 0x4a78c8). NOP-disabled elements each call their own draw function,
+-- so those are only checked to be some jal instruction.
+local JAL_BEGIN_DRAW = 0x0C129E32
+
+local function IsJal(word)
+    return bit.band(word, 0xFC000000) == 0x0C000000
+end
+
 -- These element offsets are offsets away from base_offset
 local ui_elements = {
     -- base_offset and steps are used to find the opcode,
@@ -51,12 +64,12 @@ local ui_elements = {
     group_member_panel  = { type = "opcode", base_offset = wnd_game_offset, steps = {0x0418}, opcode = NOP},
     group_compass_marks = { type = "opcode", base_offset = wnd_game_offset, steps = {0x010C}, opcode = NOP},
     pet_panel           = { type = "opcode", base_offset = wnd_game_offset, steps = {0x0464}, opcode = NOP},
-    chat_window         = { type = "opcode", base_offset = wnd_chat_offset, steps = {0xE8}, opcode = NOP, disable_opcode = CHAT_WINDOW_DISABLE_BRANCH},
+    chat_window         = { type = "opcode", base_offset = wnd_chat_offset, steps = {0xE8}, opcode = NOP, disable_opcode = CHAT_WINDOW_DISABLE_BRANCH, expected = JAL_BEGIN_DRAW},
     -- All three hotbar windows share these two draw functions (VIWndHUDMenu_Draw
     -- and its expanded variant), so one pair of patches hides every bar.
-    hotbar_draw_compact  = { type = "opcode", base_offset = wnd_game_offset, steps = {0xD5D8}, opcode = NOP, disable_opcode = HOTBAR_COMPACT_DISABLE_BRANCH},
-    hotbar_draw_expanded = { type = "opcode", base_offset = wnd_game_offset, steps = {0xDB44}, opcode = NOP, disable_opcode = HOTBAR_EXPANDED_DISABLE_BRANCH},
-    active_effects       = { type = "opcode", base_offset = wnd_game_offset, steps = {0x118A8}, opcode = NOP, disable_opcode = ACTIVE_EFFECTS_DISABLE_BRANCH},
+    hotbar_draw_compact  = { type = "opcode", base_offset = wnd_game_offset, steps = {0xD5D8}, opcode = NOP, disable_opcode = HOTBAR_COMPACT_DISABLE_BRANCH, expected = JAL_BEGIN_DRAW},
+    hotbar_draw_expanded = { type = "opcode", base_offset = wnd_game_offset, steps = {0xDB44}, opcode = NOP, disable_opcode = HOTBAR_EXPANDED_DISABLE_BRANCH, expected = JAL_BEGIN_DRAW},
+    active_effects       = { type = "opcode", base_offset = wnd_game_offset, steps = {0x118A8}, opcode = NOP, disable_opcode = ACTIVE_EFFECTS_DISABLE_BRANCH, expected = JAL_BEGIN_DRAW},
 }
 
 local UI = {}
@@ -93,11 +106,20 @@ local function DisableUIElement(ui_element)
         -- need a specific replacement opcode instead.
         local disable_opcode = ui_element.disable_opcode or NOP
         local curr_opcode = Util.ReadFromOffset(offset, "uint32_t")
-        -- Only capture the original opcode if we're not already looking at a disabled state,
-        -- otherwise re-disabling would overwrite the saved original with our patch opcode.
-        if(curr_opcode ~= NOP and curr_opcode ~= disable_opcode) then
-            ui_element.opcode = curr_opcode
+        if(curr_opcode == NOP or curr_opcode == disable_opcode) then
+            -- Already in a disabled state, nothing to write or capture.
+            ui_element.patched_offset = offset
+            return true
         end
+        -- Only patch when the word looks like the real draw instruction. A chain
+        -- that resolved somewhere unexpected fails this and we refuse to write,
+        -- since patching an unverified word corrupts whatever lives there.
+        local expected = ui_element.expected
+        if (expected ~= nil and curr_opcode ~= expected)
+            or (expected == nil and not IsJal(curr_opcode)) then
+            return false
+        end
+        ui_element.opcode = curr_opcode
         WriteInstruction(offset, disable_opcode)
         -- Remembered so Enable can restore even when the chain cannot be
         -- resolved at that moment, e.g. a chain anchored on the focused
@@ -121,7 +143,11 @@ local function EnableUIElement(ui_element)
     if offset == nil then
         return false
     end
-    if(ui_element.opcode ~= NOP) then
+    -- Only write where our patch is actually present. If the word there is not
+    -- the disable opcode the element is not ours to restore (fresh resolve went
+    -- elsewhere, or the game reloaded the code), so writing would corrupt it.
+    if(ui_element.opcode ~= NOP
+        and Util.ReadFromOffset(offset, "uint32_t") == disable_opcode) then
         WriteInstruction(offset, ui_element.opcode)
     end
     ui_element.patched_offset = nil

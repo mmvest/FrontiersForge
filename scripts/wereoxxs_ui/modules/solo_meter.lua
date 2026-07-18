@@ -9,6 +9,10 @@
     totals, the session totals, and a history of finished fights, in the same
     shapes damage_meter.lua draws.
 
+    Where a fight starts and ends is decided by the encounter engine in meter.lua,
+    from the counters fed in here. Combat reports individual events and nothing
+    more, so the fight boundaries are this module's judgement call to make.
+
     This module never reads game memory. The counters arrive from the caller.
 ]]
 
@@ -30,12 +34,13 @@ function SoloMeter.new()
     }, SoloMeter)
 end
 
---- Folds the local player's lifetime counters in and runs the encounter clock.
+--- Folds the local player's lifetime counters in and refreshes the encounter
+--- snapshot. Call every frame, including while the meter window is closed, or
+--- the counters drift out of step with the fight boundaries.
 --- @param totals table Lifetime damage_done, damage_taken, healing_done, healing_taken.
---- @param battle_music boolean|nil From the game, so the meter never reads memory.
-function SoloMeter:Update(now_ms, totals, battle_music)
+function SoloMeter:Update(now_ms, totals)
     self.meter:Observe(CLIENT_ID, totals, now_ms, self.config)
-    self.meter:Update(now_ms, self.config, battle_music)
+    self.meter:Update(now_ms, self.config)
 
     local active = self.meter.active
     self.encounter = {

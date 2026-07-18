@@ -96,20 +96,34 @@ function Util.IsValidEEPointer(ptr)
     return ptr ~= nil and ptr > 0 and ptr < Util.EE_RAM_SIZE
 end
 
+-- A bad offset here would become a host-side access violation that kills the
+-- emulator process, so raise a Lua error naming the caller instead.
+local function CheckOffsetBounds(offset, ctype, action)
+    if type(offset) ~= "number" or offset < 0
+        or offset + ffi.sizeof(ctype) > Util.EE_RAM_SIZE then
+        error(("attempt to %s %s at out-of-bounds EE offset %s")
+            :format(action, ctype, tostring(offset)), 3)
+    end
+end
+
 --- Reads a value of the given ctype from EEmem plus offset.
+--- Raises a Lua error if the access would fall outside EE RAM.
 --- @param offset integer Offset from EEmem to read from.
 --- @param ctype string The ctype to read (e.g. "uint32_t").
 --- @return any value The value read at that offset.
 function Util.ReadFromOffset(offset, ctype)
+    CheckOffsetBounds(offset, ctype, "read")
     local ptr = ffi.cast(ctype .. "*", ee_mem + offset)
     return ptr[0]
 end
 
 --- Writes a value of the given ctype to EEmem plus offset.
+--- Raises a Lua error if the access would fall outside EE RAM.
 --- @param offset integer Offset from EEmem to write to.
 --- @param ctype string The ctype to write (e.g. "uint32_t").
 --- @param value any The value to write.
 function Util.WriteToOffset(offset, ctype, value)
+    CheckOffsetBounds(offset, ctype, "write")
     local ptr = ffi.cast(ctype .. "*", Util.EEmem() + offset)
     ptr[0] = value
 end

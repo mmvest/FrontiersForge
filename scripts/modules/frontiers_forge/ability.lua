@@ -10,7 +10,10 @@ ffi.cdef[[
         uint32_t right_index;           // +0x0C  right child index (0 = none)
         uint32_t id;                    // +0x10  ability id (tree key)
         uint32_t unknown_14;            // +0x14
-        uint32_t category;              // +0x18  0xFC and above = special/inventory?
+        uint32_t display_index;         // +0x18  position in the spellbook as shown to the player,
+                                        //        0-based. Unique per ability, and the key the server
+                                        //        uses to address one. 0xFC and above are the item
+                                        //        pseudo-entries rather than real abilities.
         uint32_t valid;                 // +0x1C  nonzero when this record holds a real ability?
         uint32_t spellbook_slot;        // +0x20  spellbook position; 0-4 also appear on the hotbar,
                                         //        0xFC-0xFF are the specific items placed in hotbar slots 5-8
@@ -70,9 +73,13 @@ function Ability:GetId()
     return self.ptr.id
 end
 
---- @return integer category Category code. Values 0xFC and above appear to be special or inventory entries.
-function Ability:GetCategory()
-    return self.ptr.category
+--- Position of this ability in the spellbook as the player sees it, 0-based. It
+--- is unique per ability and is how the server addresses one, so it is the key
+--- cooldown messages arrive under. Values 0xFC and above are the item
+--- pseudo-entries rather than real abilities.
+--- @return integer display_index Spellbook position.
+function Ability:GetDisplayIndex()
+    return self.ptr.display_index
 end
 
 --- @return integer slot Spellbook sort position. Values 0xFC to 0xFF are items placed in hotbar slots 5 to 8.
@@ -128,9 +135,10 @@ function Ability:GetEquipRequirements()
 end
 
 --- Whether the ability is currently on cooldown (its hotbar icon is dimmed).
---- Cooldowns are server authoritative. The flag is set the moment the cast
---- starts and cleared when the server sends the ability ready message, the
---- client never tracks the remaining time itself.
+--- Cooldowns are server authoritative. Both the set and the clear arrive on
+--- server opcode 0xB3, which rewrites the whole ability record, so the client
+--- never tracks the remaining time itself. See AbilityList.Events for the
+--- lockout edges as they happen.
 --- @return boolean on_cooldown True while the ability is on cooldown.
 function Ability:IsOnCooldown()
     return self.ptr.cooldown_lockout_ms > 0

@@ -27,6 +27,29 @@ local ClassIcon = require("class_icon")
 
 local PartyFrames = {}
 
+-- Ranges for every sized setting, shared by the settings sliders and the auto
+-- fit clamp so the two can never disagree. The upper ends are generous enough
+-- for the largest font on offer.
+local LIMITS = {
+    cell_width        = { 60, 600 },
+    cell_height       = { 30, 400 },
+    bar_width         = { 40, 590 },
+    health_bar_height = { 4, 120 },
+    power_bar_height  = { 4, 120 },
+    pet_frame_height  = { 8, 90 },
+    class_icon_size   = { 8, 64 },
+    effect_icon_size  = { 8, 64 },
+    exp_bar_thickness = { 1, 60 },
+}
+
+local function ClampSetting(key, value)
+    local limit = LIMITS[key]
+    if limit == nil then
+        return value
+    end
+    return math.max(limit[1], math.min(limit[2], value))
+end
+
 --- Everything the user can change. One flat table, so it can be handed straight
 --- to the UiForge profile save and load callbacks.
 function PartyFrames.DefaultConfig()
@@ -42,6 +65,14 @@ function PartyFrames.DefaultConfig()
         cell_spacing = 3,
         cell_rounding = 3,
         fill_down_columns = true,
+
+        -- Grow every size with the font, so raising the font size never leaves
+        -- text spilling out of its plate. The new sizes are written back into
+        -- these settings rather than forced each frame, so the sliders can be
+        -- pulled back down afterwards and stay where they are put.
+        auto_fit = true,
+        -- The text line height the sizes above were last fitted to.
+        fitted_line_h = nil,
 
         -- Overlay puts the health bar behind the whole entry, with the name
         -- and numbers sitting on top of it and the power bar as a strip
@@ -174,6 +205,79 @@ local function FormatValue(current, maximum, as_percent)
     return string.format("%d/%d", current, maximum)
 end
 
+local ELLIPSIS = "..."
+
+-- Steps back off a UTF-8 continuation byte, so a cut never lands inside a
+-- multi byte character and leaves a broken glyph behind.
+local function Utf8Floor(text, len)
+    while len > 0 and bit.band(text:byte(len + 1) or 0, 0xC0) == 0x80 do
+        len = len - 1
+    end
+    return len
+end
+
+--- The most of a string that fits in max_w, ending in an ellipsis when it had
+--- to be cut. Returns nil when not even the ellipsis fits.
+local function Truncate(text, max_w)
+    if text == nil or text == "" then
+        return text
+    end
+    if ImGui.CalcTextSize(text) <= max_w then
+        return text
+    end
+    if ImGui.CalcTextSize(ELLIPSIS) > max_w then
+        return nil
+    end
+    -- Longest prefix that still fits once the ellipsis is on the end.
+    local low, high = 0, #text
+    while low < high do
+        local mid = math.floor((low + high + 1) / 2)
+        if ImGui.CalcTextSize(text:sub(1, Utf8Floor(text, mid)) .. ELLIPSIS) <= max_w then
+            low = mid
+        else
+            high = mid - 1
+        end
+    end
+    low = Utf8Floor(text, low)
+    if low <= 0 then
+        -- Room for the ellipsis but not a single character before it, so the
+        -- ellipsis alone stands in for the name.
+        return ELLIPSIS
+    end
+    return text:sub(1, low) .. ELLIPSIS
+end
+
+--- Grows every size with the font so text keeps its room. Only runs when the
+--- line height actually changed, and writes the result back into the config,
+--- which leaves the user free to shrink anything afterwards. Safe to call
+--- every frame, and must be called with the window's font active.
+--- @param config table Edited in place.
+function PartyFrames.FitToFont(config)
+    local _, line_h = ImGui.CalcTextSize("Ay")
+    if line_h == nil or line_h <= 0 then
+        return
+    end
+
+    local fitted = config.fitted_line_h
+    if fitted == nil or fitted <= 0 or config.auto_fit == false then
+        -- Nothing to grow from yet, or the user turned growing off, so just
+        -- remember where we are and leave the sizes alone.
+        config.fitted_line_h = line_h
+        return
+    end
+    if math.abs(line_h - fitted) < 0.5 then
+        return
+    end
+
+    local scale = line_h / fitted
+    for key in pairs(LIMITS) do
+        if type(config[key]) == "number" then
+            config[key] = ClampSetting(key, math.floor(config[key] * scale + 0.5))
+        end
+    end
+    config.fitted_line_h = line_h
+end
+
 -- Text over a bar needs a shadow or it vanishes against the bright part of it.
 local function ShadowedText(draw_list, x, y, text, config)
     Paint.Text(draw_list, x + 1, y + 1, text, config.color_text_shadow)
@@ -275,13 +379,28 @@ local function DrawNameRow(draw_list, x, y, w, member, config, opts)
         end
     end
 
-    local _, name_h = ImGui.CalcTextSize(member.name or "?")
-    ShadowedText(draw_list, text_x, y, member.name or "?", config)
-
+    -- The level owns the right end of the row, so the name gets whatever is
+    -- left and is cut short rather than running under it.
+    local level_label, level_w
     if config.show_level and member.level ~= nil and member.level > 0 then
-        local label = tostring(member.level)
-        local level_w = ImGui.CalcTextSize(label)
-        ShadowedText(draw_list, x + w - level_w, y, label, config)
+        level_label = tostring(member.level)
+        level_w = ImGui.CalcTextSize(level_label) + 6
+    end
+
+    local name = member.name or "?"
+    local _, name_h = ImGui.CalcTextSize(name)
+    local name_w = (x + w) - text_x - (level_w or 0)
+    local shown = Truncate(name, name_w)
+    if shown ~= nil then
+        ShadowedText(draw_list, text_x, y, shown, config)
+        -- The full name is worth a hover once it no longer fits.
+        if shown ~= name and Paint.HitRegion("name", text_x, y, name_w, name_h) then
+            Paint.Tooltip(name)
+        end
+    end
+
+    if level_label ~= nil then
+        ShadowedText(draw_list, x + w - (level_w - 6), y, level_label, config)
     end
 
     return text_x, math.max(name_h, config.show_class_icons and ClassIconSize(config) or 0)
@@ -536,16 +655,25 @@ local function DrawPetFrame(draw_list, x, y, w, h, member, config)
     Paint.Border(draw_list, px, y, pw, h, { 0, 0, 0, 0.7 }, 2, 1)
 
     -- Name on the left and percent on the right, inside the bar the way the
-    -- owner's name sits inside the cell. A long name clips at the bar's edge.
+    -- owner's name sits inside the cell. The percent keeps its room, so a long
+    -- name is cut short rather than running under it.
     local pad_x = 4
     local _, text_h = ImGui.CalcTextSize(name)
     local text_y = y + (h - text_h) / 2
-    Paint.PushClip(draw_list, px, y, pw, h)
-    ShadowedText(draw_list, px + pad_x, text_y, name, config)
+
+    local label, label_w
     if percent ~= nil then
-        local label = string.format("%d%%", percent)
-        local label_w = ImGui.CalcTextSize(label)
-        ShadowedText(draw_list, px + pw - pad_x - label_w, text_y, label, config)
+        label = string.format("%d%%", percent)
+        label_w = ImGui.CalcTextSize(label) + 6
+    end
+
+    Paint.PushClip(draw_list, px, y, pw, h)
+    local shown = Truncate(name, pw - pad_x * 2 - (label_w or 0))
+    if shown ~= nil then
+        ShadowedText(draw_list, px + pad_x, text_y, shown, config)
+    end
+    if label ~= nil then
+        ShadowedText(draw_list, px + pw - pad_x - (label_w - 6), text_y, label, config)
     end
     Paint.PopClip(draw_list)
 
@@ -655,6 +783,10 @@ function PartyFrames.Draw(roster, config, opts)
     opts = opts or {}
     local now_ms = opts.now_ms
 
+    -- Before anything is measured, so a font change is already accounted for
+    -- in this frame's sizes rather than the next one's.
+    PartyFrames.FitToFont(config)
+
     local draw_list = ImGui.GetWindowDrawList()
     local origin_x, origin_y = ImGui.GetCursorScreenPos()
     local spacing = config.cell_spacing
@@ -709,19 +841,46 @@ end
 
 --- The settings panel for the grid.
 --- @param config table Edited in place.
-function PartyFrames.DrawSettings(config)
+--- @param opts table|nil Which sections apply to this frame:
+---   single    one frame rather than a grid, so the grid layout controls are
+---             dropped and the wording says frame instead of entry
+---   no_exp    hide the experience bar section
+---   no_pets   hide the pet section
+---   no_effects hide the buffs and debuffs section
+function PartyFrames.DrawSettings(config, opts)
+    opts = opts or {}
+    -- A single frame is a frame, only a grid has entries in it.
+    local noun = opts.single and "Frame" or "Entry"
+    local noun_lower = opts.single and "frame" or "entry"
+
+    -- A slider bound to a size the auto fit also drives, so the two always
+    -- agree on the range.
+    local function SizeSlider(label, key)
+        config[key] = ImGui.SliderInt(label, config[key], LIMITS[key][1], LIMITS[key][2])
+    end
+
     ImGui.Text("Layout")
-    config.columns = ImGui.SliderInt("Entries per row", config.columns, 1, 6)
-    config.rows = ImGui.SliderInt("Entries per column", config.rows, 1, 6)
-    config.cell_width = ImGui.SliderInt("Entry width", config.cell_width, 60, 300)
-    config.cell_height = ImGui.SliderInt("Entry height", config.cell_height, 30, 160)
-    config.cell_spacing = ImGui.SliderInt("Spacing", config.cell_spacing, 0, 12)
+    config.auto_fit = ImGui.Checkbox("Grow to fit the font", config.auto_fit ~= false)
+    ImGui.Text("Raising the font size grows these sizes to match. They are")
+    ImGui.Text("ordinary settings afterwards, so anything can be pulled back")
+    ImGui.Text("down and it stays there until the font changes again.")
+    if not opts.single then
+        config.columns = ImGui.SliderInt("Entries per row", config.columns, 1, 6)
+        config.rows = ImGui.SliderInt("Entries per column", config.rows, 1, 6)
+    end
+    SizeSlider(noun .. " width", "cell_width")
+    SizeSlider(noun .. " height", "cell_height")
+    if not opts.single then
+        config.cell_spacing = ImGui.SliderInt("Spacing", config.cell_spacing, 0, 12)
+    end
     config.cell_rounding = ImGui.SliderInt("Corner rounding", config.cell_rounding, 0, 12)
-    config.fill_down_columns = ImGui.Checkbox("Fill down columns first", config.fill_down_columns)
+    if not opts.single then
+        config.fill_down_columns = ImGui.Checkbox("Fill down columns first", config.fill_down_columns)
+    end
 
     ImGui.Separator()
     ImGui.Text("Style")
-    config.overlay_style = ImGui.Checkbox("Overlay, health bar fills the entry",
+    config.overlay_style = ImGui.Checkbox("Overlay, health bar fills the " .. noun_lower,
         config.overlay_style)
     if config.overlay_style then
         ImGui.Text("The name and numbers sit on the health bar, with the power")
@@ -732,29 +891,29 @@ function PartyFrames.DrawSettings(config)
 
     ImGui.Separator()
     ImGui.Text("Surrounding box")
-    config.show_frame = ImGui.Checkbox("Box around the frames", config.show_frame)
+    config.show_frame = ImGui.Checkbox(
+        opts.single and "Box around the frame" or "Box around the frames", config.show_frame)
     config.frame_padding = ImGui.SliderInt("Box padding", config.frame_padding, 0, 20)
     config.frame_rounding = ImGui.SliderInt("Box rounding", config.frame_rounding, 0, 12)
 
     ImGui.Separator()
     ImGui.Text("Bars")
-    config.power_bar_height = ImGui.SliderInt("Power bar height", config.power_bar_height, 4, 40)
+    SizeSlider("Power bar height", "power_bar_height")
     config.bar_rounding = ImGui.SliderInt("Bar rounding", config.bar_rounding, 0, 8)
     ImGui.Text("Square bars keep the fill edges straight. The softer look comes")
-    ImGui.Text("from the entry corners rounding around them.")
+    ImGui.Text("from the " .. noun_lower .. " corners rounding around them.")
     config.color_health_by_class = ImGui.Checkbox("Color health bars by class",
         config.color_health_by_class)
 
     if not config.overlay_style then
-        -- In overlay the health bar is the entry, so these have nothing to act on.
+        -- In overlay the health bar is the cell, so these have nothing to act on.
         -- One width for both, otherwise the cells stop lining up with each other.
-        config.bar_width = ImGui.SliderInt("Bar width, both bars", config.bar_width, 40, 290)
-        config.health_bar_height = ImGui.SliderInt("Health bar height",
-            config.health_bar_height, 4, 40)
+        SizeSlider("Bar width, both bars", "bar_width")
+        SizeSlider("Health bar height", "health_bar_height")
 
         if config.bar_width > config.cell_width - 8 then
             ImGui.TextColored(1, 0.75, 0.35, 1,
-                "The bars are wider than the entry, so they are clipped.")
+                "The bars are wider than the " .. noun_lower .. ", so they are clipped.")
         end
     end
 
@@ -770,89 +929,116 @@ function PartyFrames.DrawSettings(config)
     ImGui.Separator()
     ImGui.Text("Class icons")
     config.show_class_icons = ImGui.Checkbox("Class icons", config.show_class_icons)
-    config.class_icon_size = ImGui.SliderInt("Class icon size", config.class_icon_size, 8, 28)
+    SizeSlider("Class icon size", "class_icon_size")
     config.class_icon_scale = ImGui.SliderFloat("Class icon scale", config.class_icon_scale, 0.5, 3.0)
 
-    ImGui.Separator()
-    ImGui.Text("Buffs and debuffs")
-    config.show_effects = ImGui.Checkbox("Your active effects on the frame", config.show_effects)
-    -- The game itself holds at most 8 effects, the deserializer clamps there.
-    config.max_effects = ImGui.SliderInt("Most effects to draw", config.max_effects, 1, 8)
-    config.effect_icon_size = ImGui.SliderInt("Effect icon size", config.effect_icon_size, 8, 28)
-    ImGui.Text("Hover an icon for the effect's name. The client only knows your")
-    ImGui.Text("own effects, so other frames never have any to show.")
-
-    ImGui.Separator()
-    ImGui.Text("Experience")
-    config.show_exp_bar = ImGui.Checkbox("Experience bar on the entries", config.show_exp_bar)
-    if config.show_exp_bar then
-        local positions = {
-            { key = "left",   label = "Vertical, left edge" },
-            { key = "right",  label = "Vertical, right edge" },
-            { key = "top",    label = "Horizontal, above the health bar" },
-            { key = "bottom", label = "Horizontal, under the power bar" },
-        }
-        for _, entry in ipairs(positions) do
-            if ImGui.RadioButton(entry.label, config.exp_bar_position == entry.key) then
-                config.exp_bar_position = entry.key
-            end
-        end
-        config.exp_bar_thickness = ImGui.SliderInt("Bar thickness",
-            config.exp_bar_thickness, 1, 20)
-        ImGui.Text("The bar gets its own strip of the entry, so the entry grows")
-        ImGui.Text("by the thickness rather than covering the other bars.")
-
-        local horizontal = config.exp_bar_position == "top" or config.exp_bar_position == "bottom"
-        if horizontal then
-            ImGui.Text("Text on the bar")
-            local modes = {
-                { key = "none",    label = "No text" },
-                { key = "numbers", label = "Current / needed" },
-                { key = "percent", label = "Percent" },
-                { key = "both",    label = "Both" },
-            }
-            for _, entry in ipairs(modes) do
-                if ImGui.RadioButton(entry.label, config.exp_text_mode == entry.key) then
-                    config.exp_text_mode = entry.key
-                end
-            end
-            if config.exp_text_mode ~= "none" then
-                ImGui.Text("The text only fits once the bar is thick enough to hold it.")
-            end
-        end
-
-        config.color_exp = ImGui.ColorEdit4("Experience color", config.color_exp)
-        ImGui.Text("Hover the bar for the exact experience numbers.")
+    if not opts.no_effects then
+        ImGui.Separator()
+        ImGui.Text("Buffs and debuffs")
+        config.show_effects = ImGui.Checkbox("Your active effects on the frame", config.show_effects)
+        -- The game itself holds at most 8 effects, the deserializer clamps there.
+        config.max_effects = ImGui.SliderInt("Most effects to draw", config.max_effects, 1, 8)
+        SizeSlider("Effect icon size", "effect_icon_size")
+        ImGui.Text("Hover an icon for the effect's name. The client only knows your")
+        ImGui.Text("own effects, so other frames never have any to show.")
     end
 
-    ImGui.Separator()
-    ImGui.Text("Pets")
-    config.show_pets = ImGui.Checkbox("Pet frames under their owners", config.show_pets)
-    if config.show_pets then
-        config.pet_frame_height = ImGui.SliderInt("Pet frame height", config.pet_frame_height, 8, 28)
-        config.pet_frame_indent = ImGui.SliderInt("Pet frame indent", config.pet_frame_indent, 0, 40)
-        config.color_pet = ImGui.ColorEdit4("Pet health color", config.color_pet)
-        ImGui.Text("A pet is a name and a health percent, which is everything the")
-        ImGui.Text("game exposes about one.")
+    if not opts.no_exp then
+        ImGui.Separator()
+        ImGui.Text("Experience")
+        config.show_exp_bar = ImGui.Checkbox(
+            opts.single and "Experience bar on the frame" or "Experience bar on the entries",
+            config.show_exp_bar)
+        if config.show_exp_bar then
+            local positions = {
+                { key = "left",   label = "Vertical, left edge" },
+                { key = "right",  label = "Vertical, right edge" },
+                { key = "top",    label = "Horizontal, above the health bar" },
+                { key = "bottom", label = "Horizontal, under the power bar" },
+            }
+            for _, entry in ipairs(positions) do
+                if ImGui.RadioButton(entry.label, config.exp_bar_position == entry.key) then
+                    config.exp_bar_position = entry.key
+                end
+            end
+            SizeSlider("Bar thickness", "exp_bar_thickness")
+            ImGui.Text("The bar gets its own strip of the " .. noun_lower .. ", which grows")
+            ImGui.Text("by the thickness rather than covering the other bars.")
+
+            local horizontal = config.exp_bar_position == "top"
+                or config.exp_bar_position == "bottom"
+            if horizontal then
+                ImGui.Text("Text on the bar")
+                local modes = {
+                    { key = "none",    label = "No text" },
+                    { key = "numbers", label = "Current / needed" },
+                    { key = "percent", label = "Percent" },
+                    { key = "both",    label = "Both" },
+                }
+                for _, entry in ipairs(modes) do
+                    if ImGui.RadioButton(entry.label, config.exp_text_mode == entry.key) then
+                        config.exp_text_mode = entry.key
+                    end
+                end
+                if config.exp_text_mode ~= "none" then
+                    ImGui.Text("The text only fits once the bar is thick enough to hold it.")
+                end
+            end
+
+            config.color_exp = ImGui.ColorEdit4("Experience color", config.color_exp)
+            ImGui.Text("Hover the bar for the exact experience numbers.")
+        end
+    end
+
+    if not opts.no_pets then
+        ImGui.Separator()
+        ImGui.Text("Pets")
+        config.show_pets = ImGui.Checkbox(
+            opts.single and "Pet frame under your own" or "Pet frames under their owners",
+            config.show_pets)
+        if config.show_pets then
+            SizeSlider("Pet frame height", "pet_frame_height")
+            config.pet_frame_indent = ImGui.SliderInt("Pet frame indent", config.pet_frame_indent, 0, 40)
+            config.color_pet = ImGui.ColorEdit4("Pet health color", config.color_pet)
+            ImGui.Text("A pet is a name and a health percent, which is everything the")
+            ImGui.Text("game exposes about one.")
+        end
     end
 
     ImGui.Separator()
     ImGui.Text("Colors")
     local swatches = {
-        { key = "color_health",        label = "Health" },
-        { key = "color_health_low",    label = "Health when low" },
-        { key = "color_power",         label = "Power" },
-        { key = "color_bar_bg",        label = "Bar background" },
-        { key = "color_background",    label = "Entry background" },
-        { key = "color_border",        label = "Border" },
-        { key = "color_border_self",   label = "Border, you" },
-        { key = "color_border_leader", label = "Border, leader" },
-        { key = "color_border_no_mod", label = "Border, no mod" },
-        { key = "color_frame_bg",      label = "Box background" },
-        { key = "color_frame_border",  label = "Box border" },
-        { key = "color_dead",          label = "Dead" },
-        { key = "color_text",          label = "Text" },
+        { key = "color_health",     label = "Health" },
+        { key = "color_health_low", label = "Health when low" },
+        { key = "color_power",      label = "Power" },
+        { key = "color_bar_bg",     label = "Bar background" },
+        { key = "color_background", label = noun .. " background" },
     }
+
+    -- Who leads and who is running the mod only mean something across a
+    -- roster. A single frame draws one border, the self one on your own frame
+    -- and the plain one on the target, so only that is worth offering.
+    if opts.single then
+        swatches[#swatches + 1] = {
+            key = opts.self_border and "color_border_self" or "color_border",
+            label = "Border",
+        }
+    else
+        swatches[#swatches + 1] = { key = "color_border",        label = "Border" }
+        swatches[#swatches + 1] = { key = "color_border_self",   label = "Border, you" }
+        swatches[#swatches + 1] = { key = "color_border_leader", label = "Border, leader" }
+        swatches[#swatches + 1] = { key = "color_border_no_mod", label = "Border, no mod" }
+    end
+
+    for _, swatch in ipairs({
+        { key = "color_frame_bg",     label = "Box background" },
+        { key = "color_frame_border", label = "Box border" },
+        { key = "color_dead",         label = "Dead" },
+        { key = "color_text",         label = "Text" },
+    }) do
+        swatches[#swatches + 1] = swatch
+    end
+
     for _, swatch in ipairs(swatches) do
         config[swatch.key] = ImGui.ColorEdit4(swatch.label, config[swatch.key])
     end

@@ -163,9 +163,9 @@ local WND_GAME_STATIC_PTR  = 0x14E200
 local WND_GAME_DRAW_STEPS  = { 0x190, 0x53C, 0x20, 0x1C }
 local WND_GAME_DRAW_STATIC = 0x006AD8D8
 
--- Cave + control block, clear of combat.lua (0xF0000) and input.lua (0xF1000) regions.
-local SEND_CAVE_OFFSET = 0x000F2000
-local SENDCTL_OFFSET   = 0x000F2100
+-- Cave + control block, clear of combat.lua (0xF5000) and input.lua (0xF6000) regions.
+local SEND_CAVE_OFFSET = 0x000F7000
+local SENDCTL_OFFSET   = 0x000F7100
 -- Control block: +0x0 saved ra, +0x4 saved a0, +0x8 pending flag, +0xC magic.
 -- UTF-16 text buffer starts at +0x20 (ChatInput_ProcessTypedText requires
 -- strlen16(text) < 0x80 units, so 0x100 bytes including the terminator suffices).
@@ -275,7 +275,7 @@ function Chat.InstallSendHook()
     if magic ~= SEND_MAGIC then
         for offset = SEND_CAVE_OFFSET, SEND_REGION_END - 4, 4 do
             if Util.ReadFromOffset(offset, "uint32_t") ~= 0 then
-                return false, "chat send hook: cave region at 0xF2000 is not free"
+                return false, "chat send hook: cave region at 0xF7000 is not free"
             end
         end
     end

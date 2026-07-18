@@ -4,9 +4,11 @@ AUTHORS: Avoids and Wereoxx
 
 world_map.lua
 
-A full-screen world map for EQOA. Shows the whole Tunaria map image (zoom, pan,
-follow), your position and facing arrow, and city labels, using the same
-world<->texture coordinate math as mini_map.lua.
+A full-screen world map for EQOA. Shows a map image for every world (Tunaria,
+Rathe, Odus, Solusek's Eye, Plane of Sky, and the hidden planes) with zoom, pan,
+follow, your position and facing arrow, and city labels, using the same
+world<->texture coordinate math as mini_map.lua. Tunaria uses the hand made map
+art, the other worlds use maps rendered from the game's own world geometry.
 
 On top of the map it adds an entity search in the side panel. It searches a
 shipped entity database (scripts\resources\entity_database.json) by name (fuzzy
@@ -37,11 +39,20 @@ world_map_state = world_map_state or {
     initialized                 = false,
     callbacks_registered        = false,
 
-    map_texture                          = nil,
     player_indicator_border_texture      = nil,
     player_indicator_fill_texture        = nil,
 
-    -- Same world/texture dimensions as mini_map.lua, so positions line up.
+    -- Which world's map is on screen and the lazily loaded per world textures.
+    view_world                   = 0,
+    world_textures               = {},
+    world_texture_failed         = {},
+    map_was_open                 = false,
+    last_player_world            = -1,
+
+    -- Bounds and texture size of the world currently on screen, refreshed each
+    -- frame from the WORLDS table so all the coordinate math stays one code path.
+    world_min_x                  = 0,
+    world_min_z                  = 0,
     world_width                  = 28000,
     world_height                 = 34000,
     map_texture_width            = 14784,
@@ -58,6 +69,9 @@ world_map_state = world_map_state or {
     last_map_origin_y            = nil,
     last_map_display_width       = 0,
     last_map_display_height      = 0,
+
+    -- Control panel
+    controls_collapsed           = false,
 
     -- Zoom / pan
     map_zoom                     = 1.0,
@@ -198,6 +212,35 @@ local CITY_LABELS = {
     { name = "Kerplunk Outpost", fraction_x = 0.4656, fraction_z = 0.4235, alignment = "evil", estimated = true },
 }
 
+--[[
+Per world map configuration, indexed by the game's world id. Each entry gives
+the texture file (relative to resources) plus the world-space rectangle that
+texture covers, so any recorded position maps onto its pixel. Tunaria keeps the
+hand made map art. The other maps are rendered from the world geometry in the
+game's .esf files, and their bounds are the geometry bounds of that render.
+]]
+local WORLDS = {
+    [0] = { name = "Tunaria",       file = "tunaria.jpg",
+            min_x = 0, min_z = 0, width = 28000, height = 34000,
+            tex_w = 6746, tex_h = 8192 },
+    [1] = { name = "Rathe Mountains", file = "rathe.jpg",
+            min_x = 2000, min_z = 0, width = 8000, height = 12000,
+            tex_w = 4001, tex_h = 6001 },
+    [2] = { name = "Odus",          file = "odus.jpg",
+            min_x = 2000, min_z = 0, width = 12000, height = 14000,
+            tex_w = 6001, tex_h = 7001 },
+    [3] = { name = "Solusek's Eye", file = "lavastm.jpg",
+            min_x = 4357, min_z = 4000, width = 3643, height = 2000,
+            tex_w = 1822, tex_h = 1001 },
+    [4] = { name = "Plane of Sky",  file = "planesky.jpg",
+            min_x = 4055, min_z = 4062, width = 1930, height = 3876,
+            tex_w = 965, tex_h = 1939 },
+    [5] = { name = "Hidden Planes", file = "secrets.jpg",
+            min_x = 2000, min_z = 2000, width = 6000, height = 8000,
+            tex_w = 3001, tex_h = 4001 },
+}
+local WORLD_ORDER = { 0, 1, 2, 3, 4, 5 }
+
 --------------------------------------------------------------------------------
 -- Helpers
 --------------------------------------------------------------------------------
@@ -206,6 +249,35 @@ local function Clamp01(value)
     if value < 0 then return 0 end
     if value > 1 then return 1 end
     return value
+end
+
+-- Old database entries carry no world, they are all Tunaria-era data.
+local function SpawnWorld(spawn)
+    return spawn.world or 0
+end
+
+local function GetWorldConfig(world_id)
+    return WORLDS[world_id] or WORLDS[0]
+end
+
+-- This package's own resources folder, scripts\world_map\resources.
+local RESOURCES_DIR = UiForge.scripts_path .. "\\world_map\\resources"
+local SHARED_RESOURCES_DIR = UiForge.scripts_path .. "\\resources"
+
+-- Loads a world's map texture on first use. A failed load is remembered so a
+-- missing file does not retry every frame.
+local function GetWorldTexture(world_id)
+    if WORLDS[world_id] == nil then world_id = 0 end
+    if state.world_textures[world_id] == nil and not state.world_texture_failed[world_id] then
+        local texture = UiForge.IGraphicsApi.CreateTextureFromFile(
+            RESOURCES_DIR .. "\\" .. WORLDS[world_id].file)
+        if texture ~= nil then
+            state.world_textures[world_id] = texture
+        else
+            state.world_texture_failed[world_id] = true
+        end
+    end
+    return state.world_textures[world_id]
 end
 
 local function GetCityLabelColor(state, alignment)
@@ -281,6 +353,8 @@ end
 local PERSISTED_SETTINGS = {
     "show_world_map",
     "disable_in_start_menu",
+    "view_world",
+    "controls_collapsed",
 
     "map_zoom",
     "follow_player",
@@ -367,10 +441,14 @@ local function BuildSearchRegions()
     end
     if #source == 0 then return end
 
+    -- Only spawns on the world being viewed, coordinates from different worlds
+    -- share nothing and would merge into nonsense regions.
     local spawns = {}
     for _, entry in ipairs(source) do
         for _, spawn in ipairs(entry.spawns) do
-            spawns[#spawns + 1] = { x = spawn.x, z = spawn.z, entry = entry }
+            if SpawnWorld(spawn) == state.view_world then
+                spawns[#spawns + 1] = { x = spawn.x, z = spawn.z, entry = entry }
+            end
         end
     end
     if #spawns == 0 then return end
@@ -453,6 +531,27 @@ local function BuildSearchRegions()
     end
 end
 
+-- Switches the map to another world and rebuilds the highlight regions, which
+-- only ever hold spawns on the viewed world.
+local function SetViewWorld(world_id)
+    if WORLDS[world_id] == nil then world_id = 0 end
+    if world_id ~= state.view_world then
+        state.view_world = world_id
+        BuildSearchRegions()
+    end
+end
+
+-- The world to show for a just-selected creature. Stays put when the creature
+-- has spawns on the current world, otherwise jumps to its first spawn's world.
+local function ViewWorldForEntry(entry)
+    for _, spawn in ipairs(entry.spawns) do
+        if SpawnWorld(spawn) == state.view_world then return state.view_world end
+    end
+    local first = entry.spawns[1]
+    if first ~= nil then return SpawnWorld(first) end
+    return state.view_world
+end
+
 -- One combined entry list from whichever sources are enabled, same-named
 -- creatures merged so a rat known to both shows as a single entry whose level
 -- range and spawn list cover both sources.
@@ -521,14 +620,11 @@ end
 --------------------------------------------------------------------------------
 
 local function Initialize()
-    if state.map_texture == nil then
-        state.map_texture = UiForge.IGraphicsApi.CreateTextureFromFile(UiForge.resources_path .. "\\mini_map\\tunaria.jpg")
-    end
     if state.player_indicator_border_texture == nil then
-        state.player_indicator_border_texture = UiForge.IGraphicsApi.CreateTextureFromFile(UiForge.resources_path .. "\\mini_map\\player_indicator_border.png")
+        state.player_indicator_border_texture = UiForge.IGraphicsApi.CreateTextureFromFile(SHARED_RESOURCES_DIR .. "\\player_indicator_border.png")
     end
     if state.player_indicator_fill_texture == nil then
-        state.player_indicator_fill_texture = UiForge.IGraphicsApi.CreateTextureFromFile(UiForge.resources_path .. "\\mini_map\\player_indicator_fill.png")
+        state.player_indicator_fill_texture = UiForge.IGraphicsApi.CreateTextureFromFile(SHARED_RESOURCES_DIR .. "\\player_indicator_fill.png")
     end
 
     if not state.database_loaded then
@@ -740,6 +836,9 @@ local function EntitySearchSection()
         -- spawns, clicking again brings the full result set back.
         if ImGui.Selectable(label, is_selected) then
             state.selected_entry = is_selected and nil or entry
+            if state.selected_entry ~= nil then
+                SetViewWorld(ViewWorldForEntry(state.selected_entry))
+            end
             BuildSearchRegions()
         end
     end
@@ -790,6 +889,9 @@ local function JournalBrowseSection()
         local is_selected = (state.selected_entry == entry)
         if ImGui.Selectable(EntryLabel(entry), is_selected) then
             state.selected_entry = is_selected and nil or entry
+            if state.selected_entry ~= nil then
+                SetViewWorld(ViewWorldForEntry(state.selected_entry))
+            end
             BuildSearchRegions()
         end
     end
@@ -900,13 +1002,34 @@ end
 -- Rendering
 --------------------------------------------------------------------------------
 
+-- Wide enough for the longest control-panel text (the journal drop hint).
+local CONTROL_PANEL_WIDTH = 320
+local COLLAPSE_BUTTON_RADIUS = 11
+
 -- The control panel that sits to the left of the map: view controls with the
--- player/mouse coordinate readouts, then the entity search.
-local function DrawControlPanel(player_fraction_x, player_fraction_z, player_coordinates)
-    ImGui.BeginChild("world_map_controls", 240, 0)
+-- player/mouse coordinate readouts, then the entity search. Drawn with a border
+-- (child flag 1) so the collapse button visibly sits on the panel edge.
+local function DrawControlPanel(player_fraction_x, player_fraction_z, player_coordinates, player_world, player_on_map)
+    ImGui.BeginChild("world_map_controls", CONTROL_PANEL_WIDTH, 0, 1)
     ImGui.PushItemWidth(140)
 
     ImGui.Text("View")
+    if ImGui.BeginCombo("World", GetWorldConfig(state.view_world).name) then
+        for _, world_id in ipairs(WORLD_ORDER) do
+            if ImGui.Selectable(WORLDS[world_id].name, world_id == state.view_world) then
+                SetViewWorld(world_id)
+            end
+        end
+        ImGui.EndCombo()
+    end
+    if not player_on_map then
+        ImGui.TextDisabled("You are in " .. GetWorldConfig(player_world).name)
+        ImGui.SameLine()
+        if ImGui.Button("Show") then
+            SetViewWorld(player_world)
+        end
+    end
+
     state.map_zoom = ImGui.SliderFloat("Zoom", state.map_zoom, 1.0, 20.0, string.format("%.1fx", state.map_zoom))
     state.follow_player = ImGui.Checkbox("Follow Player", state.follow_player)
 
@@ -941,17 +1064,21 @@ local function DrawControlPanel(player_fraction_x, player_fraction_z, player_coo
         local fraction_x = (mouse_x - state.last_map_origin_x) / state.last_map_display_width
         local fraction_z = (mouse_y - state.last_map_origin_y) / state.last_map_display_height
         if fraction_x >= 0 and fraction_x <= 1 and fraction_z >= 0 and fraction_z <= 1 then
-            mouse_world_x = (state.last_uv0_x + fraction_x * state.last_view_frac_w) * state.world_width
-            mouse_world_z = (state.last_uv0_z + fraction_z * state.last_view_frac_h) * state.world_height
+            mouse_world_x = state.world_min_x + (state.last_uv0_x + fraction_x * state.last_view_frac_w) * state.world_width
+            mouse_world_z = state.world_min_z + (state.last_uv0_z + fraction_z * state.last_view_frac_h) * state.world_height
         end
     end
 
     ImGui.Text(string.format("Player coords: %.0f, %.0f", player_coordinates.x, player_coordinates.z))
     if mouse_world_x ~= nil then
         ImGui.Text(string.format("Mouse coords: %.0f, %.0f", mouse_world_x, mouse_world_z))
-        local dx = mouse_world_x - player_coordinates.x
-        local dz = mouse_world_z - player_coordinates.z
-        ImGui.Text(string.format("Distance from player: %.0f", math.sqrt(dx * dx + dz * dz)))
+        if player_on_map then
+            local dx = mouse_world_x - player_coordinates.x
+            local dz = mouse_world_z - player_coordinates.z
+            ImGui.Text(string.format("Distance from player: %.0f", math.sqrt(dx * dx + dz * dz)))
+        else
+            ImGui.Text("Distance from player: -")
+        end
     else
         ImGui.Text("Mouse coords: -")
         ImGui.Text("Distance from player: -")
@@ -972,6 +1099,32 @@ local function DrawControlPanel(player_fraction_x, player_fraction_z, player_coo
 
     ImGui.PopItemWidth()
     ImGui.EndChild()
+end
+
+-- The circular collapse/expand toggle centered on the panel's right border
+-- (or on the window's left content edge while collapsed). Submitted after the
+-- map so it wins hover over the map image it overlaps when collapsed.
+local function DrawPanelCollapseButton(border_x, center_y)
+    local radius = COLLAPSE_BUTTON_RADIUS
+    ImGui.SetCursorScreenPos(border_x - radius, center_y - radius)
+    local clicked = ImGui.InvisibleButton("world_map_controls_collapse", radius * 2, radius * 2)
+    local hovered = ImGui.IsItemHovered()
+
+    local draw_list = ImGui.GetWindowDrawList()
+    local center = ImVec2.new(border_x, center_y)
+    local fill = hovered and ImGui.GetColorU32(0.36, 0.36, 0.40, 1.0)
+        or ImGui.GetColorU32(0.20, 0.20, 0.23, 1.0)
+    draw_list:AddCircleFilled(center, radius, fill)
+    draw_list:AddCircle(center, radius, ImGui.GetColorU32(0.62, 0.62, 0.66, 1.0), 0, 1.5)
+
+    local glyph = state.controls_collapsed and ">" or "<"
+    local text_width, text_height = ImGui.CalcTextSize(glyph)
+    ImGui.SetCursorScreenPos(border_x - text_width / 2, center_y - text_height / 2)
+    ImGui.Text(glyph)
+
+    if clicked then
+        state.controls_collapsed = not state.controls_collapsed
+    end
 end
 
 -- Draws the highlighted regions for the current search results. Hovering a
@@ -1035,7 +1188,10 @@ end
 local function Render()
     if Util.IsInGame() == 0 then return end
     if state.disable_in_start_menu and Util.IsStartMenuOpen() == 1 then return end
-    if state.show_world_map ~= true then return end
+    if state.show_world_map ~= true then
+        state.map_was_open = false
+        return
+    end
 
     local mouse_x, mouse_y = ImGui.GetMousePos()
     local mouse_down = ImGui.IsMouseDown(0)
@@ -1054,15 +1210,47 @@ local function Render()
     if ImGui.Begin("World Map", true, extra_window_flags) then
         ImGui.SetWindowFontScale(state.font_scale)
 
+        -- Opening the map jumps to the world the player is in, and while
+        -- following, a world change (zoning, porting) drags the map along.
+        local current_world = Util.GetWorldId()
+        if not state.map_was_open then
+            state.map_was_open = true
+            SetViewWorld(current_world)
+        elseif state.follow_player and current_world ~= state.last_player_world then
+            SetViewWorld(current_world)
+        end
+        state.last_player_world = current_world
+
+        -- Publish the viewed world's bounds so every coordinate conversion in
+        -- this frame, panel included, works against the same rectangle.
+        local cfg = GetWorldConfig(state.view_world)
+        state.world_min_x = cfg.min_x
+        state.world_min_z = cfg.min_z
+        state.world_width = cfg.width
+        state.world_height = cfg.height
+        state.map_texture_width = cfg.tex_w
+        state.map_texture_height = cfg.tex_h
+
+        local player_world = current_world
+        local player_on_map = (player_world == state.view_world)
+        local map_texture = GetWorldTexture(state.view_world)
+
         local player_coordinates = Player.GetCoordinates()
-        local player_fraction_x = Clamp01(player_coordinates.x / state.world_width)
-        local player_fraction_z = Clamp01(player_coordinates.z / state.world_height)
+        local player_fraction_x = Clamp01((player_coordinates.x - state.world_min_x) / state.world_width)
+        local player_fraction_z = Clamp01((player_coordinates.z - state.world_min_z) / state.world_height)
 
-        DrawControlPanel(player_fraction_x, player_fraction_z, player_coordinates)
-        ImGui.SameLine()
+        -- Remembered before the panel draws so the collapse button can center
+        -- itself on the panel border afterwards.
+        local content_origin_x, content_origin_y = ImGui.GetCursorScreenPos()
+        local _, content_avail_height = ImGui.GetContentRegionAvail()
 
-        if state.map_texture == nil then
-            ImGui.Text("World map image failed to load.")
+        if not state.controls_collapsed then
+            DrawControlPanel(player_fraction_x, player_fraction_z, player_coordinates, player_world, player_on_map)
+            ImGui.SameLine()
+        end
+
+        if map_texture == nil then
+            ImGui.Text(string.format("Map image for %s failed to load.", cfg.name))
         else
             local avail_width, avail_height = ImGui.GetContentRegionAvail()
             if avail_width < 50 then avail_width = 50 end
@@ -1079,7 +1267,8 @@ local function Render()
 
             local origin_x, origin_y = ImGui.GetCursorScreenPos()
 
-            if state.follow_player then
+            -- Following only makes sense while the player is on the viewed map.
+            if state.follow_player and player_on_map then
                 state.pan_center_x = player_fraction_x
                 state.pan_center_z = player_fraction_z
             end
@@ -1102,7 +1291,7 @@ local function Render()
             uv1_z = Clamp01(uv1_z)
 
             local map_tint = ImVec4.new(state.map_tint[1], state.map_tint[2], state.map_tint[3], state.map_tint[4])
-            ImGui.Image(state.map_texture, ImVec2.new(display_width, display_height),
+            ImGui.Image(map_texture, ImVec2.new(display_width, display_height),
                 ImVec2.new(uv0_x, uv0_z), ImVec2.new(uv1_x, uv1_z), map_tint, state.default_texture_border_color)
 
             state.last_map_origin_x = origin_x
@@ -1139,8 +1328,8 @@ local function Render()
             -- the visible crop. Shared by the player marker, cities, and rings.
             local function project(world_x, world_z)
                 if view_width <= 0 or view_height <= 0 then return 0, 0, false end
-                local fraction_x = Clamp01(world_x / state.world_width)
-                local fraction_z = Clamp01(world_z / state.world_height)
+                local fraction_x = Clamp01((world_x - state.world_min_x) / state.world_width)
+                local fraction_z = Clamp01((world_z - state.world_min_z) / state.world_height)
                 local marker_fraction_x = (fraction_x - uv0_x) / view_width
                 local marker_fraction_z = (fraction_z - uv0_z) / view_height
                 local visible = marker_fraction_x >= 0 and marker_fraction_x <= 1 and marker_fraction_z >= 0 and marker_fraction_z <= 1
@@ -1154,7 +1343,7 @@ local function Render()
                 world_to_pixels = (display_width / state.world_width) / view_width
             end
 
-            if view_width > 0 and view_height > 0 then
+            if player_on_map and view_width > 0 and view_height > 0 then
                 local marker_fraction_x = (player_fraction_x - uv0_x) / view_width
                 local marker_fraction_z = (player_fraction_z - uv0_z) / view_height
 
@@ -1188,7 +1377,8 @@ local function Render()
             -- selected creature's spawns (see BuildSearchRegions).
             DrawSearchRegions(draw_list, project, world_to_pixels)
 
-            if state.show_city_labels and state.map_zoom >= state.city_label_min_zoom and view_width > 0 and view_height > 0 then
+            -- The city labels are Tunaria positions, they mean nothing elsewhere.
+            if state.view_world == 0 and state.show_city_labels and state.map_zoom >= state.city_label_min_zoom and view_width > 0 and view_height > 0 then
                 for _, city in ipairs(CITY_LABELS) do
                     local skip_this_city = city.estimated and not state.show_estimated_cities
 
@@ -1231,6 +1421,14 @@ local function Render()
             end
 
         end
+
+        -- On the panel's right border when open, on the content edge when
+        -- collapsed, always vertically centered on the panel column.
+        local border_x = content_origin_x
+        if not state.controls_collapsed then
+            border_x = border_x + CONTROL_PANEL_WIDTH
+        end
+        DrawPanelCollapseButton(border_x, content_origin_y + content_avail_height / 2)
     end
     ImGui.End()
 end

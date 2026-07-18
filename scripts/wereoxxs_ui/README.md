@@ -55,7 +55,9 @@ turned off or ejected.
 ## Notes
 
 - The casting bar starts from the ability's cooldown beginning, which is the
-  one signal the client has that an ability was just used. An interrupted or
-  fizzled cast still shows the full bar, since the client is never told.
+  one signal the client has that an ability was just used. That signal is the
+  server message carrying the cooldown, so it is caught exactly when it
+  arrives rather than on the next frame. An interrupted or fizzled cast still
+  shows the full bar, since the client is never told.
 - Buffs and debuffs show icon and name only. The client is not told their
   remaining durations.

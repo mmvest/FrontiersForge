@@ -75,13 +75,21 @@ mini_map_state = mini_map_state or {
 
     -- Rebuild tuning
     tex_size        = 512,
-    tris_per_frame  = 8000,
+    step_ms         = 4,        -- raster time spent per frame while rebuilding
     rebuild_move_frac = 0.35,   -- rebuild when player moved this fraction of build radius
     rebuild_y_delta = 10,       -- rebuild when player altitude changed this much
     rebuild_cut_delta = 5,      -- rebuild when the ceiling cut moved this much
+    cut_hold        = 0.5,      -- indoor/outdoor flip must hold this long to count
+
+    -- Render quality
+    smooth_render   = true,     -- 2x supersample with bilinear texture filtering
+    sun_shading     = true,     -- shade slopes and walls by how much they face up
 
     -- Overlay settings
     show_player     = true,
+    player_arrow_size = 22,
+    player_arrow_fill_color   = {0.2, 1, 0.2, 1},
+    player_arrow_border_color = {0, 0, 0, 1},
     show_border     = true,
     border_color    = {0, 0, 0, 1},
     background_color = {0.05, 0.05, 0.08, 0.85},
@@ -166,6 +174,20 @@ mini_map_state = mini_map_state or {
 }
 
 local state = mini_map_state
+
+-- A state table carried over from an older script version is missing any
+-- newly added fields, so backfill their defaults.
+for key, default in pairs({
+    step_ms = 4,
+    cut_hold = 0.5,
+    smooth_render = true,
+    sun_shading = true,
+    player_arrow_size = 22,
+    player_arrow_fill_color   = {0.2, 1, 0.2, 1},
+    player_arrow_border_color = {0, 0, 0, 1},
+}) do
+    if state[key] == nil then state[key] = default end
+end
 
 -- Auto zoom swaps which radius is live rather than overwriting the outdoor one,
 -- so zooming inside a cave never loses the zoom you set out in the world.
@@ -538,6 +560,7 @@ end
 local function CeilingCut(px, py, pz)
     if not state.auto_ceiling then
         state.indoors = false
+        state.cut_state = nil
         return py + state.ceiling_offset
     end
 
@@ -558,11 +581,31 @@ local function CeilingCut(px, py, pz)
         state.probe = probe
     end
 
-    state.indoors = probe.ceiling ~= nil
-    if probe.ceiling == nil then
+    -- A doorway makes the probe flip indoor/outdoor every step, and each flip
+    -- forces a full rebuild. Only adopt a flip once it has held for cut_hold
+    -- seconds, keeping the map steady while passing through.
+    local raw_indoors = probe.ceiling ~= nil
+    local cs = state.cut_state
+    if cs == nil then
+        cs = { indoors = raw_indoors, ceiling = probe.ceiling }
+        state.cut_state = cs
+    end
+    if raw_indoors == cs.indoors then
+        cs.pending_since = nil
+        if raw_indoors then cs.ceiling = probe.ceiling end
+    elseif cs.pending_since == nil then
+        cs.pending_since = now
+    elseif now - cs.pending_since >= state.cut_hold then
+        cs.indoors = raw_indoors
+        cs.ceiling = probe.ceiling
+        cs.pending_since = nil
+    end
+
+    state.indoors = cs.indoors
+    if not cs.indoors or cs.ceiling == nil then
         return py + OPEN_SKY_CUT
     end
-    return probe.ceiling - state.ceiling_margin
+    return cs.ceiling - state.ceiling_margin
 end
 
 -- ---------------------------------------------------------------------------
@@ -581,6 +624,8 @@ local function StartRebuild(px, py, pz, cut_y)
         above_range = state.above_range,
         textured = state.textured,
         lighting = state.world_lighting,
+        sun = state.sun_shading,
+        supersample = state.smooth_render and 2 or 1,
         brightness = state.brightness,
         colors = {
             low = state.terrain_low,
@@ -596,10 +641,17 @@ local function StartRebuild(px, py, pz, cut_y)
     state.rebuild = job
 end
 
+-- Runs raster slices until the frame's time budget is spent, so rebuild speed
+-- adapts to triangle cost instead of a fixed count.
 local function StepRebuild()
     local job = state.rebuild
     if job == nil then return end
-    if MapRender.Step(job, state.tris_per_frame) then
+    local deadline = os.clock() + state.step_ms * 0.001
+    local done = MapRender.Step(job, 1500)
+    while not done and os.clock() < deadline do
+        done = MapRender.Step(job, 1500)
+    end
+    if done then
         local new_texture = MapRender.Upload(job)
         if state.texture ~= nil then
             UiForge.ReleaseTexture(state.texture)
@@ -609,7 +661,7 @@ local function StepRebuild()
             center_x = job.center_x, center_z = job.center_z,
             player_y = job.ref_y,
             cut_y = job.cut_y,
-            radius = job.radius, size = job.size,
+            radius = job.radius, size = job.out_size,
             textured = job.textured,
         }
         state.debug_stats.tris = job.tris_done
@@ -820,7 +872,60 @@ local function DrawEntities(draw_list, center, px, py, pz, scale, heading, view_
     end
 end
 
+-- Same rotation math as world_map.lua's DrawRotatedImage.
+local function DrawRotatedImage(draw_list, texture, center, dimensions, angle_of_orientation, target_angle, tint)
+    local rotation_angle = target_angle + angle_of_orientation
+    local cos_theta = math.cos(rotation_angle)
+    local sin_theta = math.sin(rotation_angle)
+
+    local half_width = dimensions.x * 0.5
+    local half_height = dimensions.y * 0.5
+
+    local corners = {
+        ImVec2.new(-half_width, -half_height),
+        ImVec2.new(half_width, -half_height),
+        ImVec2.new(half_width, half_height),
+        ImVec2.new(-half_width, half_height)
+    }
+
+    for i, corner in ipairs(corners) do
+        local rotated_x = corner.x * sin_theta - corner.y * cos_theta
+        local rotated_y = corner.x * cos_theta + corner.y * sin_theta
+        corners[i] = ImVec2.new(center.x + rotated_x, center.y + rotated_y)
+    end
+
+    draw_list:AddImageQuad(texture, corners[1], corners[2], corners[3], corners[4],
+        ImVec2.new(0, 0), ImVec2.new(1, 0), ImVec2.new(1, 1), ImVec2.new(0, 1),
+        ImGui.GetColorU32(tint[1], tint[2], tint[3], tint[4]))
+end
+
+-- Loads the shared player indicator art once. false marks a failed load, so a
+-- missing file falls back to the plain triangle instead of retrying forever.
+local function PlayerIndicatorTextures()
+    if state.arrow_fill_texture == nil then
+        local dir = UiForge.scripts_path .. "\\resources"
+        state.arrow_fill_texture = UiForge.IGraphicsApi.CreateTextureFromFile(
+            dir .. "\\player_indicator_fill.png") or false
+        state.arrow_border_texture = UiForge.IGraphicsApi.CreateTextureFromFile(
+            dir .. "\\player_indicator_border.png") or false
+    end
+    return state.arrow_fill_texture, state.arrow_border_texture
+end
+
 local function DrawPlayerArrow(draw_list, center, heading)
+    local fill_texture, border_texture = PlayerIndicatorTextures()
+    if fill_texture then
+        local dimensions = ImVec2.new(state.player_arrow_size, state.player_arrow_size)
+        local target = state.rotate_with_player and 0 or heading
+        if border_texture then
+            DrawRotatedImage(draw_list, border_texture, center, dimensions,
+                math.pi / 2, target, state.player_arrow_border_color)
+        end
+        DrawRotatedImage(draw_list, fill_texture, center, dimensions,
+            math.pi / 2, target, state.player_arrow_fill_color)
+        return
+    end
+
     -- Compass heading increases opposite to screen-space rotation, negate it.
     local ang = state.rotate_with_player and 0 or -heading
     local size = 7
@@ -1014,10 +1119,12 @@ end
 
 -- Picks the spawn zone closest to the player, since a creature can have many
 -- recorded spawns and the guidance line should point at the nearest one.
-local function NearestZone(zones, px, pz)
+-- Only zones on the given world count, guiding toward a spawn on another
+-- world would point at meaningless coordinates.
+local function NearestZone(zones, px, pz, world)
     local best, best_dsq
     for _, zone in ipairs(zones) do
-        if type(zone) == "table" and zone.x ~= nil and zone.z ~= nil then
+        if type(zone) == "table" and zone.x ~= nil and zone.z ~= nil and (zone.world or 0) == world then
             local dx, dz = zone.x - px, zone.z - pz
             local dsq = dx * dx + dz * dz
             if best_dsq == nil or dsq < best_dsq then
@@ -1063,7 +1170,7 @@ end
 -- terminates at, otherwise the line stops at the rim pointing the right way.
 local function DrawTrackingGuidance(draw_list, center, px, pz, scale, heading, view_px, origin, circular)
     if not state.db_track_active then return end
-    local zone = NearestZone(state.db_track_zones, px, pz)
+    local zone = NearestZone(state.db_track_zones, px, pz, Util.GetWorldId())
     if zone == nil then return end
 
     local target = WorldToScreen(zone.x, zone.z, px, pz, center, scale, heading)
@@ -1136,11 +1243,21 @@ local function Render()
         state.db_track_zones = nil
     end
 
-    if state.rebuild == nil then
-        local cut_y = CeilingCut(pos.x, pos.y, pos.z)
-        if NeedsRebuild(pos.x, pos.y, pos.z, cut_y) then
-            StartRebuild(pos.x, pos.y, pos.z, cut_y)
+    -- A job whose cut or center no longer matches where the player is would
+    -- finish as an already wrong map, so drop it and start over instead of
+    -- paying for two full rebuilds.
+    local cut_y = CeilingCut(pos.x, pos.y, pos.z)
+    local job = state.rebuild
+    if job ~= nil then
+        local dx, dz = pos.x - job.center_x, pos.z - job.center_z
+        local drift = job.radius * 0.5
+        if dx * dx + dz * dz > drift * drift
+            or math.abs(cut_y - job.cut_y) > state.rebuild_cut_delta * 2 then
+            state.rebuild = nil
         end
+    end
+    if state.rebuild == nil and NeedsRebuild(pos.x, pos.y, pos.z, cut_y) then
+        StartRebuild(pos.x, pos.y, pos.z, cut_y)
     end
     StepRebuild()
 
@@ -1275,6 +1392,9 @@ local function TrackedEntitiesSettings()
         -- that it honors on its next frame.
         if ImGui.Button("Stop Tracking##dbtrack") then
             shared_globals.FF_Tracking_Stop = true
+        end
+        if NearestZone(state.db_track_zones, 0, 0, Util.GetWorldId()) == nil then
+            ImGui.TextDisabled("No known spawns on this world")
         end
     end
     ImGui.Text("Guidance Line")
@@ -1427,6 +1547,23 @@ local function Settings()
             .. "Colors are clamped, so pushing it high flattens toward white.")
     end
 
+    local smooth = ImGui.Checkbox("Smooth Rendering", state.smooth_render)
+    if smooth ~= state.smooth_render then
+        state.smooth_render = smooth
+        state.built = nil
+    end
+    Tooltip("Renders the map at double resolution with filtered textures, then\n"
+        .. "downsamples. Removes the pixelated speckle at the cost of slower\n"
+        .. "rebuilds.")
+
+    local sun = ImGui.Checkbox("Sun Shading", state.sun_shading)
+    if sun ~= state.sun_shading then
+        state.sun_shading = sun
+        state.built = nil
+    end
+    Tooltip("Shades each surface by how much it faces the sky, so slopes,\n"
+        .. "cliffs, and rooftops get depth instead of rendering flat.")
+
     local compass_disabled, compass_pressed = ImGui.Checkbox("Disable Compass", state.disable_compass)
     if compass_pressed then
         state.disable_compass = compass_disabled
@@ -1549,6 +1686,11 @@ local function Settings()
         end
     end
     state.show_player   = ImGui.Checkbox("Show Player Arrow", state.show_player)
+    if state.show_player then
+        state.player_arrow_size = ImGui.SliderInt("Player Arrow Size", state.player_arrow_size, 10, 48, "%d")
+        state.player_arrow_fill_color = ImGui.ColorEdit4("Player Arrow Color", state.player_arrow_fill_color)
+        state.player_arrow_border_color = ImGui.ColorEdit4("Player Arrow Border", state.player_arrow_border_color)
+    end
     state.show_border   = ImGui.Checkbox("Show Border", state.show_border)
     state.border_color  = ImGui.ColorEdit4("Border Color", state.border_color)
     state.background_color = ImGui.ColorEdit4("Background", state.background_color)
@@ -1567,11 +1709,11 @@ local function Settings()
 
     ImGui.Separator()
     ImGui.Text("Performance")
-    state.tris_per_frame = ImGui.SliderInt("Triangles / Frame", state.tris_per_frame, 1000, 40000, "%d")
-    Tooltip("How much of the map is drawn each frame. The map rebuilds over\n"
-        .. "several frames as you move, and the old one stays on screen until\n"
-        .. "the new one is done. Raise it so the map keeps up while running,\n"
-        .. "lower it if rebuilding costs you frames in game.")
+    state.step_ms = SliderFloat("Rebuild Budget (ms)", state.step_ms, 1, 12)
+    Tooltip("Raster time spent per frame while the map rebuilds. The old map\n"
+        .. "stays on screen until the new one is done. Raise it so the map\n"
+        .. "keeps up while running, lower it if rebuilding costs you frames\n"
+        .. "in game.")
 
     state.tex_size = ImGui.SliderInt("Texture Size", state.tex_size, 256, 1024, "%d")
     Tooltip("Resolution of the map image, in pixels per side. Higher is sharper\n"
@@ -1603,8 +1745,13 @@ local function Save()
         floor_range = state.floor_range,
         above_range = state.above_range,
         tex_size = state.tex_size,
-        tris_per_frame = state.tris_per_frame,
+        step_ms = state.step_ms,
+        smooth_render = state.smooth_render,
+        sun_shading = state.sun_shading,
         show_player = state.show_player,
+        player_arrow_size = state.player_arrow_size,
+        player_arrow_fill_color = state.player_arrow_fill_color,
+        player_arrow_border_color = state.player_arrow_border_color,
         show_border = state.show_border,
         border_color = state.border_color,
         background_color = state.background_color,

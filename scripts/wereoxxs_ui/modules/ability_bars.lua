@@ -52,7 +52,14 @@ function AbilityBars.DefaultBarConfig(bar_index)
         -- swaps in the item's own inventory art instead.
         real_item_icons = false,
 
+        -- Dim an ability slot while the current target is beyond its range.
+        dim_out_of_range = true,
+        -- Dim an ability slot while it costs more power than the player has.
+        dim_low_power = true,
+
         color_empty          = { 0.08, 0.08, 0.10, 0.55 },
+        color_range_dim      = { 0.00, 0.00, 0.00, 0.55 },
+        color_power_dim      = { 0.30, 0.05, 0.08, 0.55 },
         color_slot_border    = { 0.00, 0.00, 0.00, 0.80 },
         color_selected       = { 1.00, 1.00, 1.00, 1.00 },
         selected_thickness   = 2,
@@ -151,6 +158,7 @@ local function DrawSlot(draw_list, id, x, y, slot, config)
         end
     end
 
+    -- One dim at a time, cooldown first, then low power, then out of range.
     local remaining = slot.remaining_ms or 0
     if remaining > 0 then
         Paint.Rect(draw_list, x, y, size, size, config.color_cooldown_dim, config.rounding)
@@ -162,6 +170,12 @@ local function DrawSlot(draw_list, id, x, y, slot, config)
             Paint.Text(draw_list, x + (size - text_w) / 2, y + (size - text_h) / 2,
                 label, { 1, 1, 1, 1 })
         end
+    elseif slot.low_power then
+        Paint.Rect(draw_list, x, y, size, size,
+            config.color_power_dim or { 0.30, 0.05, 0.08, 0.55 }, config.rounding)
+    elseif slot.out_of_range then
+        Paint.Rect(draw_list, x, y, size, size,
+            config.color_range_dim or { 0, 0, 0, 0.55 }, config.rounding)
     end
 
     if slot.selected then
@@ -283,6 +297,11 @@ function AbilityBars.DrawSettings(config, four_slots, hide_enabled)
         config.show_cooldown_numbers)
     config.real_item_icons = ImGui.Checkbox("Item slots show the item's own icon",
         config.real_item_icons)
+    -- Configs saved before this option treat a missing value as on.
+    config.dim_out_of_range = ImGui.Checkbox("Dim slots when the target is out of range",
+        config.dim_out_of_range ~= false)
+    config.dim_low_power = ImGui.Checkbox("Dim slots costing more power than you have",
+        config.dim_low_power ~= false)
 
     ImGui.Separator()
     ImGui.Text("Selected ability")
@@ -302,6 +321,10 @@ function AbilityBars.DrawSettings(config, four_slots, hide_enabled)
     config.color_empty = ImGui.ColorEdit4("Empty slot", config.color_empty)
     config.color_slot_border = ImGui.ColorEdit4("Slot border", config.color_slot_border)
     config.color_cooldown_dim = ImGui.ColorEdit4("Cooldown dim", config.color_cooldown_dim)
+    config.color_range_dim = ImGui.ColorEdit4("Out of range dim",
+        config.color_range_dim or { 0, 0, 0, 0.55 })
+    config.color_power_dim = ImGui.ColorEdit4("Low power dim",
+        config.color_power_dim or { 0.30, 0.05, 0.08, 0.55 })
     config.color_name_bg = ImGui.ColorEdit4("Name box background", config.color_name_bg)
     config.color_name_border = ImGui.ColorEdit4("Name box border", config.color_name_border)
     config.color_name_text = ImGui.ColorEdit4("Name box text", config.color_name_text)

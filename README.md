@@ -18,7 +18,7 @@ Use this code at your own risk. UiForge injects code into the PCSX2 emulator and
 
 ## Requirements
 
-- **[PCSX2](https://pcsx2.net/)**: Tested on 64-bit versions of PCSX2 v2.0.2 and v2.2.0, running on Windows 11. Other versions may work, but they haven't been tested.
+- **[PCSX2](https://pcsx2.net/)**: Tested on 64-bit versions of PCSX2 v1.7.3727, v2.0.2, and v2.2.0, running on Windows 11. Other versions may work, but they haven't been tested.
 - **DirectX 11/12**: Currently UiForge only supports DirectX 11 and 12, so be sure PCSX2 is using one of those for rendering.
 - **Windows OS**: This definitely works on Windows 11 64-bit. I imagine it would also work on Windows 10 and maybe Windows 7.
 - **EQOA: Frontiers (US Version)**: This has only been tested on the US version of EverQuest Online Adventures: Frontiers.
@@ -74,7 +74,7 @@ Happy modding!
 
    Note: UiForge is included as a git submodule and built binaries (like `uiforge_core.dll`) are no longer distributed directly with the repo. Use the release zip files or build locally.
 
-1. Make sure you have **PCSX2 v2.0.0** or greater and **EQOA: Frontiers (US Version) ISO**.
+1. Make sure you have **PCSX2 v1.7.3727** or greater and **EQOA: Frontiers (US Version) ISO**.
 1. Place your UI Lua scripts (dubbed ForgeScripts by the UiForge Project) in the `scripts` directory.
 1. Run `pcsx2-qt.exe`, start EQOA, and then execute `StartFrontiersForge.bat`.
 

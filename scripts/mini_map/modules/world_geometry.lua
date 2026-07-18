@@ -406,11 +406,11 @@ local function decode_buffer_row(row, out, pretrans, flags)
     end
 end
 
-local function euler_rotate(x, y, z, rx, ry, rz)
-    -- Ry*Rx*Rz, the order the engine builds actor rotations in.
-    local sx, cx = math.sin(rx), math.cos(rx)
-    local sy, cy = math.sin(ry), math.cos(ry)
-    local sz, cz = math.sin(rz), math.cos(rz)
+local function euler_rotate(x, y, z, rh, rp, rr)
+    -- VIMatrix44::RotateHPR, Ry(heading)*Rx(pitch)*Rz(roll), rot.x is heading
+    local sx, cx = math.sin(rp), math.cos(rp)
+    local sy, cy = math.sin(rh), math.cos(rh)
+    local sz, cz = math.sin(rr), math.cos(rr)
     local m00 = cy * cz + sy * sx * sz
     local m01 = -cy * sz + sy * sx * cz
     local m02 = sy * cx

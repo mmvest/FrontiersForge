@@ -47,11 +47,6 @@ function Meter.DefaultConfig()
         -- Quiet this long and the fight is over. Long enough to ride out a gap
         -- between swings, short enough not to glue two pulls together.
         idle_timeout_ms = 5000,
-        -- The game itself knows when it thinks you are fighting. While the battle
-        -- music is up the encounter is held open even through a long quiet
-        -- stretch, and the moment it stops the fight is over, which is a far
-        -- cleaner line than a timer alone.
-        use_battle_music = true,
     }
 end
 
@@ -84,7 +79,6 @@ function Meter:Begin(now_ms, manual)
     self.start_ms = now_ms
     self.last_ms = now_ms
     self.stop_ms = 0
-    self.music_seen = false
     self.totals = {}
 end
 
@@ -191,27 +185,9 @@ function Meter:GetOverall(client_id)
 end
 
 --- Closes an automatic encounter once the fighting has stopped. Call every tick.
---- @param battle_music boolean|nil Whether the game's battle music is playing, or
----   nil when the caller cannot tell, which falls back to the idle timer alone.
-function Meter:Update(now_ms, config, battle_music)
+function Meter:Update(now_ms, config)
     if not self.active or self.manual or not config.auto_encounters then
         return
-    end
-
-    if config.use_battle_music and battle_music ~= nil then
-        if battle_music then
-            -- The game says we are still fighting, so nothing else matters.
-            self.music_seen = true
-            return
-        end
-        -- The music comes up a few seconds after a fight starts but is cut the
-        -- instant it ends, so its falling edge is the cleanest end of combat we
-        -- have. It only counts once we actually saw the music come up, otherwise a
-        -- fight shorter than the music's own delay would be closed on the spot.
-        if self.music_seen then
-            self:Stop(self.last_ms)
-            return
-        end
     end
 
     if (now_ms - self.last_ms) > config.idle_timeout_ms then

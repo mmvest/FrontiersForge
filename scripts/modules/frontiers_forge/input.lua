@@ -95,10 +95,10 @@ local WND_GAME_DRAW_STATIC = 0x006AD8D8
 local SCAN_START = 0x00300000
 local SCAN_END   = 0x01800000
 
--- Cave + buffers. Kept well clear of combat.lua's region (0xF0000..~0xF0490) so both hooks
+-- Cave + buffers. Kept well clear of combat.lua's region (0xF5000..0xF58B0) so both hooks
 -- can be installed at once. Same EE kernel-reserved gap below the ELF load address.
-local KEY_CAVE_OFFSET = 0x000F1000
-local KEYBUF_OFFSET   = 0x000F1200
+local KEY_CAVE_OFFSET = 0x000F6000
+local KEYBUF_OFFSET   = 0x000F6200
 -- Buffer header: +0x0 event counter (u32), +0x4 magic, +0x8 ring size, +0xC reserved.
 -- Ring entries start at +0x10, stride 8: +0x0 key char (u8), +0x1 is_down (u8),
 --   +0x2 pad (u16), +0x4 sequence number (u32).
@@ -235,7 +235,7 @@ function Input.InstallKeyHook()
     if magic ~= KEY_BUF_MAGIC then
         for offset = KEY_CAVE_OFFSET, KEY_CAVE_REGION_END - 4, 4 do
             if Util.ReadFromOffset(offset, "uint32_t") ~= 0 then
-                return false, "keyboard hook: cave region at 0xF1000 is not free"
+                return false, "keyboard hook: cave region at 0xF6000 is not free"
             end
         end
     end

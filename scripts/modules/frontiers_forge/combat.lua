@@ -48,10 +48,13 @@ local FOREIGN_CAVE_SCAN_WORDS = 0x100
 local SCAN_START = 0x00300000
 local SCAN_END   = 0x01800000
 
--- 0x000F0000 sits in the EE kernel-reserved gap below the ELF load address, so
--- EQOA never touches it. Verified all-zero before install to be safe.
-local CAVE_CODE_OFFSET = 0x000F0000
-local BUF_OFFSET       = 0x000F00A0
+-- 0x000F5000 sits in the EE kernel-reserved gap below the ELF load address, so
+-- EQOA never touches it. Verified all-zero before install to be safe. The
+-- caves start at 0xF5000 rather than 0xF0000 because code below 0xF5000 carries
+-- references into that range, and staying clear of them avoids the question of
+-- whether those references are real.
+local CAVE_CODE_OFFSET = 0x000F5000
+local BUF_OFFSET       = 0x000F50A0
 -- Buffer header: +0x0 total event counter (u32), +0x4 magic, +0x8/+0xC reserved because who knows what I'll need to add later.
 -- Entries start at +0x10, stride 0x20:
 --   +0x0 attacker_id (u32), +0x4 defender_id (u32),
@@ -64,9 +67,6 @@ local RING_MASK   = RING_SIZE - 1
 local ENTRY_SIZE  = 0x20
 local ENTRIES_OFFSET = BUF_OFFSET + 0x10
 local CAVE_REGION_END = ENTRIES_OFFSET + RING_SIZE * ENTRY_SIZE
--- Where the previous buffer layout kept its magic, accepted as ours when
--- cleaning up after a session that ran the old module.
-local OLD_BUF_MAGIC_OFFSET = 0x000F0084
 
 -- Cave code. Clobbers t0-t9 and a1 (all dead at the patch site, the foreign
 -- cave clobbers the same set). When chain_target is given the cave ends by
@@ -285,14 +285,13 @@ function Combat.InstallHook()
     end
 
     -- The cave region must contain all zeros or our own magic (leftover from a previous session,
-    -- e.g. script reloaded without uninstalling), at either the current or the old buffer layout's
-    -- location. Anything else means the region is in use and we probably shouldn't touch it.
+    -- e.g. script reloaded without uninstalling). Anything else means the region is in use and we
+    -- probably shouldn't touch it.
     local magic = Util.ReadFromOffset(BUF_OFFSET + 4, "uint32_t")
-    local old_magic = Util.ReadFromOffset(OLD_BUF_MAGIC_OFFSET, "uint32_t")
-    if magic ~= BUF_MAGIC and old_magic ~= BUF_MAGIC then
+    if magic ~= BUF_MAGIC then
         for offset = CAVE_CODE_OFFSET, CAVE_REGION_END - 4, 4 do
             if Util.ReadFromOffset(offset, "uint32_t") ~= 0 then
-                return false, "combat hook: cave region at 0xF0000 is not free"
+                return false, "combat hook: cave region at 0xF5000 is not free"
             end
         end
     end
@@ -462,24 +461,24 @@ function Combat.GetDroppedCount()
     return hook_state.dropped
 end
 
---- Returns events captured since the previous poll. Each event table has fields:
----   attacker_id  entity id of whoever dealt the damage / cast the heal
----   defender_id  entity id of whoever received it
----   amount       signed: negative = damage, positive = healing
----   seq          monotonically increasing event number
----   color        the patched 0xDB trailer, a per-hit number color as
----                0x1000000 | B<<16 | G<<8 | R (pet swings observed as
----                0x10000FF, pure red), nil when the packet had none
----   outgoing     true if the local player dealt it themselves (pet excluded)
----   incoming     true if defender is the local player
----   from_pet     true if the local player's pet dealt it: the pet's own id as
----                attacker, or a color-tagged event attributed to the player
----                (the server credits pet swings to the owner and marks them
----                only by the color)
----   to_pet       true if defender is the local player's pet
----   is_heal      true if amount > 0
---- @return table[] events Array of event tables, oldest first. Empty if none or hook not installed.
-function Combat.PollEvents()
+-- Drains the ring buffer, returning events captured since the previous call.
+-- Destructive, so only Combat.Update may call it. Anything else draining the
+-- ring would starve every subscriber of the events it took. Event fields:
+--   attacker_id  entity id of whoever dealt the damage / cast the heal
+--   defender_id  entity id of whoever received it
+--   amount       signed, negative = damage, positive = healing
+--   seq          monotonically increasing event number
+--   color        the patched 0xDB trailer, a per-hit number color as
+--                0x1000000 | B<<16 | G<<8 | R (pet swings observed as
+--                0x10000FF, pure red), nil when the packet had none
+--   outgoing     true if the local player or their pet dealt it
+--   incoming     true if defender is the local player
+--   from_pet     informational only, true when the event looks like the pet's
+--                doing. Not reliable enough to split pet output from the
+--                player's, so nothing classifies on it
+--   to_pet       true if defender is the local player's pet
+--   is_heal      true if amount > 0
+local function PollEventsInternal()
     local events = {}
     if not hook_state.installed then
         return events
@@ -513,8 +512,9 @@ function Combat.PollEvents()
                 color = nil
             end
             -- A pet's own id shows up as the attacker on its heals, but its
-            -- swings are credited to the owner with only the color trailer to
-            -- tell them apart from the player's.
+            -- swings are credited to the owner, so the two cannot be told apart
+            -- reliably. A pet acts only on the player's behalf, so both count as
+            -- the player's own output and nothing branches on from_pet.
             local from_pet = pet_id ~= nil
                 and (attacker == pet_id or (attacker == player_id and color ~= nil))
             events[#events + 1] = {
@@ -523,7 +523,7 @@ function Combat.PollEvents()
                 color = color,
                 amount = amount,
                 seq = seq,
-                outgoing = (attacker == player_id) and not from_pet,
+                outgoing = (attacker == player_id) or (pet_id ~= nil and attacker == pet_id),
                 incoming = (defender == player_id),
                 from_pet = from_pet,
                 to_pet = (pet_id ~= nil and defender == pet_id),
@@ -536,6 +536,166 @@ function Combat.PollEvents()
 
     hook_state.last_seq = count
     return events
+end
+
+--------------------------------------------------------------------------------
+-- Hook ownership
+--------------------------------------------------------------------------------
+
+-- The hook is shared, so it is refcounted by owner. A mod releasing its own
+-- claim must not tear the patch out from under everyone else still listening.
+local hook_owners = {}
+local hook_owner_count = 0
+
+--- Claims the combat hook, installing it on the first claim. Every caller must
+--- pair this with Release, normally from its DisableScript callback.
+--- @param owner string Stable name identifying the caller, e.g. "wereoxxs_ui".
+--- @return boolean success True if the hook is up (or already was).
+--- @return string|nil error Present only when success is false.
+function Combat.Acquire(owner)
+    if hook_owners[owner] then
+        return true
+    end
+    local ok, err = Combat.InstallHook()
+    if not ok then
+        return false, err
+    end
+    hook_owners[owner] = true
+    hook_owner_count = hook_owner_count + 1
+    return true
+end
+
+--- Drops one owner's claim, uninstalling the hook once the last owner is gone.
+--- @param owner string The same name passed to Acquire.
+function Combat.Release(owner)
+    if not hook_owners[owner] then
+        return
+    end
+    hook_owners[owner] = nil
+    hook_owner_count = hook_owner_count - 1
+    if hook_owner_count <= 0 then
+        hook_owner_count = 0
+        Combat.UninstallHook()
+    end
+end
+
+--- @return integer count How many owners currently hold the hook.
+function Combat.GetOwnerCount()
+    return hook_owner_count
+end
+
+--- Whether one specific owner holds a claim. The hook being installed says
+--- nothing about whether this caller is one of the owners keeping it up.
+--- @param owner string The name passed to Acquire.
+--- @return boolean held
+function Combat.HasClaim(owner)
+    return hook_owners[owner] == true
+end
+
+--------------------------------------------------------------------------------
+-- Event bus
+--------------------------------------------------------------------------------
+
+-- The hook is a single patch site but the events it carries are not all the
+-- same thing, so one poller classifies each event and fans it out to whoever
+-- asked for that kind. Only these names are ever emitted.
+-- These report what the hook captured and nothing more. Higher level notions
+-- like "a fight is running" are deliberately absent, since where a fight starts
+-- and ends is a judgement call (how long a lull ends it, whether healing counts)
+-- that belongs to whoever is consuming the events, not to the module reporting
+-- them.
+Combat.Events = {
+    OnDamageDealt     = "OnDamageDealt",     -- player or pet dealt damage
+    OnDamageReceived  = "OnDamageReceived",  -- player took damage
+    OnHealingDealt    = "OnHealingDealt",
+    OnHealingReceived = "OnHealingReceived",
+}
+
+local subscribers = {}      -- event name -> owner -> handler
+local subscriber_errors = {}
+
+--- Subscribes to one combat event. Subscribing the same owner and event again
+--- replaces the previous handler, so a hot reload cannot stack duplicates.
+--- @param owner string Stable name identifying the caller.
+--- @param event_name string One of Combat.Events.
+--- @param fn function Receives the event table (see the field list above).
+function Combat.On(owner, event_name, fn)
+    if Combat.Events[event_name] == nil then
+        return false, "unknown combat event: " .. tostring(event_name)
+    end
+    subscribers[event_name] = subscribers[event_name] or {}
+    subscribers[event_name][owner] = fn
+    return true
+end
+
+--- Unsubscribes an owner. Drops every subscription it holds when event_name is nil.
+function Combat.Off(owner, event_name)
+    if event_name ~= nil then
+        if subscribers[event_name] ~= nil then
+            subscribers[event_name][owner] = nil
+        end
+        return
+    end
+    for _, handlers in pairs(subscribers) do
+        handlers[owner] = nil
+    end
+end
+
+-- A handler that errors is dropped rather than left to fail every frame. The
+-- error is kept so the mod that broke can be identified instead of silently
+-- going quiet.
+local function Emit(event_name, payload)
+    local handlers = subscribers[event_name]
+    if handlers == nil then
+        return
+    end
+    for owner, fn in pairs(handlers) do
+        local ok, err = pcall(fn, payload)
+        if not ok then
+            handlers[owner] = nil
+            subscriber_errors[#subscriber_errors + 1] = {
+                owner = owner, event = event_name, error = tostring(err),
+            }
+            while #subscriber_errors > 16 do
+                table.remove(subscriber_errors, 1)
+            end
+        end
+    end
+end
+
+--- Errors raised by subscriber handlers, oldest first. Each row is
+--- { owner, event, error }. The handler was dropped when its error was recorded.
+--- @return table[] errors
+function Combat.GetSubscriberErrors()
+    return subscriber_errors
+end
+
+--------------------------------------------------------------------------------
+-- Dispatch
+--------------------------------------------------------------------------------
+
+-- Classifies one polled event and fires the public events it belongs to. A
+-- self-heal has the player as both parties, so it fires dealt and received.
+local function DispatchEvent(event)
+    if event.is_heal then
+        if event.outgoing then Emit(Combat.Events.OnHealingDealt, event) end
+        if event.incoming then Emit(Combat.Events.OnHealingReceived, event) end
+    else
+        if event.outgoing then Emit(Combat.Events.OnDamageDealt, event) end
+        if event.incoming then Emit(Combat.Events.OnDamageReceived, event) end
+    end
+end
+
+--- Drains the ring once and dispatches to subscribers. Safe to call from every
+--- subscriber's frame, since a second call in the same frame finds the ring
+--- already empty.
+function Combat.Update()
+    if not hook_state.installed then
+        return
+    end
+    for _, event in ipairs(PollEventsInternal()) do
+        DispatchEvent(event)
+    end
 end
 
 return Combat

@@ -11,6 +11,7 @@
 local Player      = require("frontiers_forge.player")
 local EntityList  = require("frontiers_forge.entity_list")
 local AbilityBar  = require("frontiers_forge.ability_bar")
+local AbilityList = require("frontiers_forge.ability_list")
 local Effects     = require("frontiers_forge.effects")
 local Combat      = require("frontiers_forge.combat")
 local Chat        = require("frontiers_forge.chat")
@@ -48,14 +49,17 @@ frame_config = frame_config or (function()
     config.show_frame = false
     return config
 end)()
--- The target frame borrows the player frame's settings but is one plain health
--- bar, no power strip, no exp, no pets, no box.
-target_frame_config = target_frame_config or setmetatable({
-    show_frame = false,
-    show_power_bar = false,
-    show_exp_bar = false,
-    show_pets = false,
-}, { __index = frame_config })
+-- The target frame is styled on its own, starting as one plain health bar with
+-- no power strip, no exp, no pets, and no box.
+target_frame_config = target_frame_config or (function()
+    local config = PartyFrames.DefaultConfig()
+    config.show_frame = false
+    config.show_power_bar = false
+    config.show_exp_bar = false
+    config.show_pets = false
+    config.show_effects = false
+    return config
+end)()
 -- Group rows carry a name and a health percent, so the group cells default
 -- to just that, no exp bar, no pets.
 group_frame_config = group_frame_config or (function()
@@ -107,8 +111,8 @@ combat_totals = combat_totals or {
 combat_event_log = combat_event_log or {}
 local EVENT_LOG_SIZE = 16
 
--- Cooldown countdowns per ability id. The game stores a whole lockout and never
--- counts it down, so the countdown runs off the rising edge here.
+-- Cooldown countdowns keyed by spellbook display index. The game stores a whole
+-- lockout and never counts it down, so the countdown runs from the start event.
 cooldown_running = cooldown_running or {}
 
 -- Entities carry only a health percent, so the target's real health is
@@ -137,6 +141,9 @@ local FONTS = {
     { name = "Merriweather Sans", path = "fonts/Merriweather_Sans/static/MerriweatherSans-Regular.ttf" },
 }
 local DEFAULT_FONT_SIZE = 13
+-- The built in font only stretches through the window scale, the file backed
+-- fonts are loaded at the real size, so they stay crisp regardless of size.
+local MAX_FONT_SIZE = 48
 
 local FONT_WINDOWS = {
     { key = "bars", label = "Ability bars" },
@@ -163,77 +170,122 @@ end
 -- Sampling the game
 --------------------------------------------------------------------------------
 
-local function UpdateCombatTotals()
-    if not Combat.IsHookInstalled() then
+local HOOK_OWNER = "wereoxxs_ui"
+
+-- One event can fire two subscriptions, a self heal being both dealt and
+-- received, so the sequence number keeps it to a single row in the log.
+local function LogCombatEvent(event)
+    local last = combat_event_log[#combat_event_log]
+    if last ~= nil and last.seq == event.seq then
         return
     end
-    for _, event in ipairs(Combat.PollEvents()) do
-        combat_event_log[#combat_event_log + 1] = event
-        while #combat_event_log > EVENT_LOG_SIZE do
-            table.remove(combat_event_log, 1)
-        end
-        if event.outgoing or event.incoming or event.from_pet then
-            local amount = math.abs(event.amount)
-            local done = event.is_heal and "healing_done" or "damage_done"
-            local taken = event.is_heal and "healing_taken" or "damage_taken"
-            -- The pet's damage counts as the player's, by choice.
-            if event.outgoing or event.from_pet then
-                combat_totals[done] = combat_totals[done] + amount
-                -- Damage landing on the current target feeds its health estimate.
-                if not event.is_heal and target_estimate ~= nil
-                    and event.defender_id == target_estimate.id then
-                    target_estimate.damage = target_estimate.damage + amount
-                end
-            end
-            if event.incoming then
-                combat_totals[taken] = combat_totals[taken] + amount
-            end
-        end
+    combat_event_log[#combat_event_log + 1] = event
+    while #combat_event_log > EVENT_LOG_SIZE do
+        table.remove(combat_event_log, 1)
     end
 end
 
--- The remaining time on an ability, run down locally from the lockout's rising
--- edge, since the game itself never counts it down.
-local function CooldownRemaining(ability, now_ms)
-    local id = ability:GetId()
-    if id == nil then
-        return 0
-    end
-
-    local lockout = ability:GetCooldownLockoutMs() or 0
-    if lockout <= 0 or not ability:IsOnCooldown() then
-        cooldown_running[id] = nil
-        return 0
-    end
-
-    local running = cooldown_running[id]
-    if running == nil or running.lockout ~= lockout then
-        running = { lockout = lockout, started_ms = now_ms }
-        cooldown_running[id] = running
-
-        -- A fresh lockout is also the signal that the ability was just used,
-        -- which is what starts the casting bar.
-        local cast_time = ability:GetCastTime() or 0
-        if cast_time > 0 then
-            local fg, fg_w, fg_h = Icon.GetTexture(ability:GetIconForegroundRef(),
-                { trim_transparent = true, trim_color = true })
-            local bg, bg_w, bg_h = Icon.GetTexture(ability:GetIconBackgroundRef(),
-                { trim_transparent = true, trim_color = true })
-            active_cast = {
-                name = ability:GetName(),
-                duration_ms = cast_time * 1000,
-                started_ms = now_ms,
-                fg = fg, fg_w = fg_w, fg_h = fg_h,
-                bg = bg, bg_w = bg_w, bg_h = bg_h,
-            }
+-- Combat owns the hook and publishes what it captures, so the totals are built
+-- from subscriptions rather than by draining the ring here.
+local function SubscribeToCombat()
+    Combat.On(HOOK_OWNER, Combat.Events.OnDamageDealt, function(event)
+        LogCombatEvent(event)
+        local amount = math.abs(event.amount)
+        combat_totals.damage_done = combat_totals.damage_done + amount
+        -- Damage landing on the current target feeds its health estimate.
+        if target_estimate ~= nil and event.defender_id == target_estimate.id then
+            target_estimate.damage = target_estimate.damage + amount
         end
+    end)
+
+    Combat.On(HOOK_OWNER, Combat.Events.OnDamageReceived, function(event)
+        LogCombatEvent(event)
+        combat_totals.damage_taken = combat_totals.damage_taken + math.abs(event.amount)
+    end)
+
+    Combat.On(HOOK_OWNER, Combat.Events.OnHealingDealt, function(event)
+        LogCombatEvent(event)
+        combat_totals.healing_done = combat_totals.healing_done + math.abs(event.amount)
+    end)
+
+    Combat.On(HOOK_OWNER, Combat.Events.OnHealingReceived, function(event)
+        LogCombatEvent(event)
+        combat_totals.healing_taken = combat_totals.healing_taken + math.abs(event.amount)
+    end)
+end
+
+local function SubscribeToAbilities()
+    AbilityList.On(HOOK_OWNER, AbilityList.Events.OnLockoutStart, function(event)
+        local now_ms = NowMs()
+        cooldown_running[event.display_index] = {
+            lockout = event.lockout_ms,
+            started_ms = now_ms,
+        }
+
+        -- A lockout starting is also the signal that the ability was just used,
+        -- which is what starts the casting bar.
+        local ability = AbilityList.GetAbilityByDisplayIndex(event.display_index)
+        if ability == nil then
+            return
+        end
+        local cast_time = ability:GetCastTime() or 0
+        if cast_time <= 0 then
+            return
+        end
+        local fg, fg_w, fg_h = Icon.GetTexture(ability:GetIconForegroundRef(),
+            { trim_transparent = true, trim_color = true })
+        local bg, bg_w, bg_h = Icon.GetTexture(ability:GetIconBackgroundRef(),
+            { trim_transparent = true, trim_color = true })
+        active_cast = {
+            name = ability:GetName(),
+            duration_ms = cast_time * 1000,
+            started_ms = now_ms,
+            fg = fg, fg_w = fg_w, fg_h = fg_h,
+            bg = bg, bg_w = bg_w, bg_h = bg_h,
+        }
+    end)
+
+    AbilityList.On(HOOK_OWNER, AbilityList.Events.OnLockoutEnd, function(event)
+        cooldown_running[event.display_index] = nil
+    end)
+end
+
+-- Reads the countdown the events set up. Nothing is decided here, so a slot
+-- cannot start or clear a cooldown just by being drawn.
+local function CooldownRemaining(ability, now_ms)
+    local display_index = ability:GetDisplayIndex()
+    if display_index == nil then
+        return 0
     end
 
-    return math.max(0, lockout - (now_ms - running.started_ms))
+    local running = cooldown_running[display_index]
+    if running ~= nil then
+        return math.max(0, running.lockout - (now_ms - running.started_ms))
+    end
+
+    if ability:IsOnCooldown() then
+        return ability:GetCooldownLockoutMs() or 0
+    end
+    return 0
+end
+
+-- The player and target positions for the range dim, resolved once per frame.
+-- Returns nil when nothing is targeted, which leaves every slot undimmed.
+local function TargetRangePoints()
+    local target_id = Player.GetTargetEntityId()
+    if target_id == nil or target_id == 0 or target_id == 0xFFFFFFFF then
+        return nil
+    end
+    local entity = EntityList.GetEntityById(target_id)
+    if entity == nil then
+        return nil
+    end
+    local tx, ty, tz = entity:GetPosition()
+    return { from = Player.GetCoordinates(), to = { x = tx, y = ty, z = tz } }
 end
 
 -- One prepared slot row for the bars module.
-local function BuildSlot(bar, index, selected, now_ms, config)
+local function BuildSlot(bar, index, selected, now_ms, config, range_points, current_pwr)
     local slot = { empty = true }
     local ability = AbilityBar.GetAbility(bar, index)
     local item = ability == nil and AbilityBar.GetItem(bar, index) or nil
@@ -246,7 +298,13 @@ local function BuildSlot(bar, index, selected, now_ms, config)
         slot.bg, slot.bg_w, slot.bg_h = Icon.GetTexture(ability:GetIconBackgroundRef(),
             { trim_transparent = true, trim_color = true })
         slot.remaining_ms = CooldownRemaining(ability, now_ms)
+        if range_points ~= nil and config ~= nil and config.dim_out_of_range ~= false then
+            slot.out_of_range = not ability:IsInRange(range_points.from, range_points.to)
+        end
         local cost = ability:GetPwrCost() or 0
+        if current_pwr ~= nil and config ~= nil and config.dim_low_power ~= false then
+            slot.low_power = cost > current_pwr
+        end
         slot.tooltip = string.format("%s\n%s\nPower  %d",
             slot.name or "?", ability:GetDescription() or "", cost)
     elseif item ~= nil then
@@ -363,6 +421,8 @@ end
 local function DrawAbilityBarWindows(now_ms)
     local selected_bar = AbilityBar.GetSelectedBarIndex()
     local selected_slot = AbilityBar.GetSelectedSlotIndex(selected_bar or 0)
+    local range_points = TargetRangePoints()
+    local current_pwr = Player.GetCurrentPwr()
     local pushed = PushWindowFont("bars")
 
     for bar = 0, 2 do
@@ -373,7 +433,8 @@ local function DrawAbilityBarWindows(now_ms)
                 local slots = {}
                 for i = 0, count - 1 do
                     slots[#slots + 1] = BuildSlot(bar, i,
-                        bar == selected_bar and i == selected_slot, now_ms, config)
+                        bar == selected_bar and i == selected_slot, now_ms, config, range_points,
+                        current_pwr)
                 end
                 local name_x, name_y, name
                 if ImGui.Begin("wereoxxs bar " .. (bar + 1), true, OVERLAY_FLAGS) then
@@ -615,9 +676,6 @@ local function GetGear()
 end
 
 local function DrawMeter(now_ms)
-    solo_meter:SetIdentity(Player.GetName(), Player.GetClassId())
-    solo_meter:Update(now_ms, combat_totals, nil)
-
     local encounter = solo_meter:GetEncounter()
     local totals = solo_meter:GetTotals()
     local overall = solo_meter:GetOverall()
@@ -810,8 +868,13 @@ local function Settings()
                 end
                 ImGui.EndCombo()
             end
-            fc.size = ImGui.SliderInt(entry.label .. " size", fc.size, 8, 32)
+            fc.size = ImGui.SliderInt(entry.label .. " size", fc.size, 8, MAX_FONT_SIZE)
+            if fc.font == "Default" and fc.size > DEFAULT_FONT_SIZE * 2 then
+                ImGui.TextDisabled("The built in font is stretched to this size. Pick one of")
+                ImGui.TextDisabled("the others for crisp text this large.")
+            end
         end
+        ImGui.Text("Ctrl+click a slider to type an exact size.")
         ImGui.TreePop()
     end
 
@@ -882,11 +945,12 @@ local function Settings()
         ImGui.TreePop()
     end
 
-    if ImGui.TreeNode("Player and target frames") then
-        PartyFrames.DrawSettings(frame_config)
+    if ImGui.TreeNode("Player frame") then
+        PartyFrames.DrawSettings(frame_config, { single = true, self_border = true })
+        ImGui.TreePop()
+    end
 
-        ImGui.Separator()
-        ImGui.Text("Target frame")
+    if ImGui.TreeNode("Target frame") then
         windows.target_hp_estimate = ImGui.Checkbox(
             "Estimate the target's health next to its percent", windows.target_hp_estimate)
         if windows.target_hp_estimate then
@@ -895,6 +959,11 @@ local function Settings()
             ImGui.TextColored(0.95, 0.35, 0.35, 1.0,
                 "client, so on shared kills the estimate reads high.")
         end
+        ImGui.Separator()
+        -- The client shares nothing about a target's experience, pet, or
+        -- effects, so those sections have nothing to drive.
+        PartyFrames.DrawSettings(target_frame_config,
+            { single = true, no_exp = true, no_pets = true, no_effects = true })
         ImGui.TreePop()
     end
 
@@ -976,6 +1045,7 @@ local function Save()
         bar_configs = bar_configs,
         cast_config = cast_config,
         frame_config = frame_config,
+        target_frame_config = target_frame_config,
         group_frame_config = group_frame_config,
         compass_config = compass_config,
         meter_config = meter_config,
@@ -1003,11 +1073,29 @@ local function Load(saved)
     end
     merge(grid_config, saved.grid_config)
     merge(font_configs, saved.font_configs)
+    -- A hand edited profile could ask for a size no font is loaded at.
+    for _, entry in ipairs(FONT_WINDOWS) do
+        local fc = font_configs[entry.key]
+        fc.size = math.max(8, math.min(MAX_FONT_SIZE, fc.size or DEFAULT_FONT_SIZE))
+    end
     for bar = 1, 3 do
         merge(bar_configs[bar], saved.bar_configs and saved.bar_configs[bar])
     end
     merge(cast_config, saved.cast_config)
     merge(frame_config, saved.frame_config)
+    if type(saved.target_frame_config) == "table" then
+        merge(target_frame_config, saved.target_frame_config)
+    else
+        -- Profiles saved while the target frame still inherited the player
+        -- frame's settings keep that look, rather than snapping to defaults
+        -- the first time they load.
+        merge(target_frame_config, saved.frame_config)
+        target_frame_config.show_frame = false
+        target_frame_config.show_power_bar = false
+        target_frame_config.show_exp_bar = false
+        target_frame_config.show_pets = false
+        target_frame_config.show_effects = false
+    end
     merge(group_frame_config, saved.group_frame_config)
     merge(compass_config, saved.compass_config)
     merge(meter_config, saved.meter_config)
@@ -1016,9 +1104,10 @@ end
 
 local function Cleanup()
     RestoreGameUi()
-    if Combat.IsHookInstalled() then
-        Combat.UninstallHook()
-    end
+    Combat.Off(HOOK_OWNER)
+    Combat.Release(HOOK_OWNER)
+    AbilityList.Off(HOOK_OWNER)
+    AbilityList.Release(HOOK_OWNER)
     if Chat.IsSendHookInstalled() then
         Chat.UninstallSendHook()
     end
@@ -1037,6 +1126,9 @@ local function Cleanup()
 end
 
 if not initialized then
+    SubscribeToCombat()
+    SubscribeToAbilities()
+    cooldown_running = {}
     UiForge.RegisterCallback(UiForge.CallbackType.Settings, Settings)
     UiForge.RegisterCallback(UiForge.CallbackType.Save, Save)
     UiForge.RegisterCallback(UiForge.CallbackType.Load, Load)
@@ -1051,9 +1143,8 @@ end
 
 if Util.IsInGame() ~= 0 then
     -- The hooks feed the meter and the chat send, so bring them up once in game.
-    if not Combat.IsHookInstalled() then
-        Combat.InstallHook()
-    end
+    Combat.Acquire(HOOK_OWNER)
+    AbilityList.Acquire(HOOK_OWNER)
     if not send_hook_tried and not Chat.IsSendHookInstalled() then
         send_hook_tried = true
         Chat.InstallSendHook()
@@ -1063,7 +1154,10 @@ if Util.IsInGame() ~= 0 then
     local paused = Util.IsStartMenuOpen() ~= 0
 
     ApplyGameUiState(paused)
-    UpdateCombatTotals()
+    Combat.Update()
+    AbilityList.Update()
+    solo_meter:SetIdentity(Player.GetName(), Player.GetClassId())
+    solo_meter:Update(now_ms, combat_totals)
     PumpEnterKey(now_ms, paused)
 
     if not paused then
