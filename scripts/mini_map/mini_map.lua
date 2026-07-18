@@ -29,6 +29,11 @@ local EntityList    = require("frontiers_forge.entity_list")
 local WorldGeometry = require("world_geometry")
 local MapRender     = require("map_render")
 
+-- Each ForgeScript runs in a private environment whose _G is itself, so the
+-- world map's published tracking table never lands in this script's _G.
+-- getfenv(0) is the thread's real global table, shared by every script.
+local shared_globals = getfenv(0)
+
 -- The cut height used under open sky. Nothing in the world reaches this, so the
 -- whole scene, mountain tops included, survives the cut.
 local OPEN_SKY_CUT = 1e9
@@ -116,6 +121,13 @@ mini_map_state = mini_map_state or {
     entity_tracking_enabled     = false,
     ping_tracked_entities       = false,
     line_to_tracked_entities    = false,
+
+    -- World map guidance line, drawn whenever the world map is tracking a
+    -- target, independent of the toggles above.
+    db_line_color               = {1.0, 0.85, 0.2, 0.9},
+    db_line_thickness           = 2.0,
+    db_line_speed               = 26,   -- pixels per second the dashes travel
+    db_track_seen_revision      = -1,
     tracked_entity_input        = "",
     tracked_entities            = {},
     tracked_entities_by_key     = {},
@@ -689,7 +701,9 @@ end
 -- The ping is a ring that expands and fades out of a tracked entity on a fixed
 -- cycle. Returns the phase (0 to 1) and its color, or nil between pings.
 local function PingPulse()
-    if not (state.entity_tracking_enabled and state.ping_tracked_entities) then
+    -- A target pushed from the world map counts as tracking too, so its pings
+    -- fire even when the .entl tracking layer is switched off.
+    if not ((state.entity_tracking_enabled or state.db_track_active) and state.ping_tracked_entities) then
         return nil, nil
     end
     local ping_period = 1.5
@@ -712,6 +726,13 @@ local function DrawEntities(draw_list, center, px, py, pz, scale, heading, view_
     local line_color = ImGui.GetColorU32(1, 1, 1, 0.75)
     local tracking = state.entity_tracking_enabled and state.tracked_entities_by_key ~= nil
     local ping_phase, ping_color = PingPulse()
+
+    -- A world-map search target: a normalized name that should be treated as
+    -- tracked even when it is not in the .entl list, so its live entity pings and
+    -- draws a line once it comes into view.
+    local db_track_name = state.db_track_active and state.db_track_name or nil
+    local db_track_fill = ImGui.GetColorU32(1.0, 0.85, 0.2, 1.0)
+    local db_track_border = ImGui.GetColorU32(0, 0, 0, 1)
 
     -- Slot 1 is always the player.
     for i = 2, #entities do
@@ -743,8 +764,9 @@ local function DrawEntities(draw_list, center, px, py, pz, scale, heading, view_
                     local border = default_border
 
                     local is_tracked = false
+                    local normalized_name = NormalizeEntityName(name)
                     if tracking then
-                        local index = state.tracked_entities_by_key[NormalizeEntityName(name)]
+                        local index = state.tracked_entities_by_key[normalized_name]
                         local entry = index and state.tracked_entities[index] or nil
                         if entry ~= nil and entry.enabled ~= false then
                             is_tracked = true
@@ -753,6 +775,14 @@ local function DrawEntities(draw_list, center, px, py, pz, scale, heading, view_
                             border = ImGui.GetColorU32(entry.border_color[1], entry.border_color[2],
                                                        entry.border_color[3], entry.border_color[4])
                         end
+                    end
+
+                    -- Fall back to the world-map target when the .entl layer did not
+                    -- already claim this entity.
+                    if not is_tracked and db_track_name ~= nil and normalized_name == db_track_name then
+                        is_tracked = true
+                        fill = db_track_fill
+                        border = db_track_border
                     end
 
                     if not is_tracked and dy > state.entity_y_range * 0.5 then
@@ -969,6 +999,110 @@ local function ApplyMapFontScale()
     end
 end
 
+-- Reads the shared tracking table published by the world map. Returns the
+-- normalized name and the list of candidate spawn zones, or nil when nothing is
+-- being tracked. The contract is intentionally small so the two mods stay
+-- decoupled, see world_map.lua PublishTracking.
+local function ReadDatabaseTracking()
+    local shared = shared_globals.FF_Tracking
+    if type(shared) ~= "table" or shared.active ~= true then return nil end
+    if type(shared.name) ~= "string" or type(shared.zones) ~= "table" or #shared.zones == 0 then
+        return nil
+    end
+    return shared
+end
+
+-- Picks the spawn zone closest to the player, since a creature can have many
+-- recorded spawns and the guidance line should point at the nearest one.
+local function NearestZone(zones, px, pz)
+    local best, best_dsq
+    for _, zone in ipairs(zones) do
+        if type(zone) == "table" and zone.x ~= nil and zone.z ~= nil then
+            local dx, dz = zone.x - px, zone.z - pz
+            local dsq = dx * dx + dz * dz
+            if best_dsq == nil or dsq < best_dsq then
+                best_dsq = dsq
+                best = zone
+            end
+        end
+    end
+    return best
+end
+
+-- A dashed line whose dashes travel from p0 toward p1 over time, giving the
+-- guidance line a sense of direction.
+local function DrawAnimatedDashedLine(draw_list, p0, p1, color, thickness)
+    local dx, dz = p1.x - p0.x, p1.y - p0.y
+    local length = math.sqrt(dx * dx + dz * dz)
+    if length < 1 then return end
+    local ux, uy = dx / length, dz / length
+
+    local dash = 8
+    local gap = 6
+    local period = dash + gap
+    local phase = (ImGui.GetTime() * state.db_line_speed) % period
+
+    -- Dashes sit at phase mod period, and start one period early so the
+    -- segment at p0 is covered. Growing phase slides them p0 toward p1.
+    local d = phase - period
+    while d < length do
+        local start = math.max(0, d)
+        local finish = math.min(length, d + dash)
+        if finish > start then
+            draw_list:AddLine(
+                ImVec2.new(p0.x + ux * start, p0.y + uy * start),
+                ImVec2.new(p0.x + ux * finish, p0.y + uy * finish),
+                color, thickness)
+        end
+        d = d + period
+    end
+end
+
+-- Draws the guidance line from the player to the nearest tracked spawn zone. When
+-- the zone falls inside the minimap it also draws the zone marker circle the line
+-- terminates at, otherwise the line stops at the rim pointing the right way.
+local function DrawTrackingGuidance(draw_list, center, px, pz, scale, heading, view_px, origin, circular)
+    if not state.db_track_active then return end
+    local zone = NearestZone(state.db_track_zones, px, pz)
+    if zone == nil then return end
+
+    local target = WorldToScreen(zone.x, zone.z, px, pz, center, scale, heading)
+    local dx, dy = target.x - center.x, target.y - center.y
+    local dist = math.sqrt(dx * dx + dy * dy)
+
+    local rim = view_px * 0.5
+    local marker_margin = 8
+    local c = state.db_line_color
+    local line_color = ImGui.GetColorU32(c[1], c[2], c[3], c[4])
+
+    local inside
+    if circular then
+        inside = dist <= (rim - marker_margin)
+    else
+        inside = target.x >= origin.x and target.x <= origin.x + view_px
+             and target.y >= origin.y and target.y <= origin.y + view_px
+    end
+
+    if inside then
+        DrawAnimatedDashedLine(draw_list, center, target, line_color, state.db_line_thickness)
+        -- The "you are here / it is here" zone marker at the center of the zone.
+        draw_list:AddCircleFilled(target, 4, ImGui.GetColorU32(c[1], c[2], c[3], c[4] * 0.55))
+        draw_list:AddCircle(target, 6, line_color, 0, 2.0)
+    else
+        -- Clip the endpoint to the rim so the line never renders outside the map.
+        local endpoint
+        if dist > 0 then
+            local reach = rim - marker_margin
+            endpoint = ImVec2.new(center.x + (dx / dist) * reach, center.y + (dy / dist) * reach)
+        else
+            endpoint = center
+        end
+        DrawAnimatedDashedLine(draw_list, center, endpoint, line_color, state.db_line_thickness)
+        -- A small arrowhead nub at the rim, pointing the way to go.
+        draw_list:AddCircleFilled(endpoint, 3, line_color)
+    end
+end
+
 local function Render()
     if Util.IsInGame() == 0 then return end
     -- An overlay floating over the pause screen is just in the way.
@@ -979,6 +1113,28 @@ local function Render()
 
     local pos = Player.GetCoordinates()
     local heading = Util.GetCompassRadians()
+
+    -- Pick up any target the world map published this frame.
+    local db_track = ReadDatabaseTracking()
+    if db_track ~= nil then
+        state.db_track_active = true
+        state.db_track_name = NormalizeEntityName(db_track.name)
+        state.db_track_display = db_track.name
+        state.db_track_zones = db_track.zones
+        -- A freshly pushed target switches the tracking layer on so the
+        -- creature highlights and pings without a trip to the settings.
+        local revision = tonumber(db_track.revision) or 0
+        if revision ~= state.db_track_seen_revision then
+            state.db_track_seen_revision = revision
+            state.entity_tracking_enabled = true
+            state.ping_tracked_entities = true
+        end
+    else
+        state.db_track_active = false
+        state.db_track_name = nil
+        state.db_track_display = nil
+        state.db_track_zones = nil
+    end
 
     if state.rebuild == nil then
         local cut_y = CeilingCut(pos.x, pos.y, pos.z)
@@ -1020,6 +1176,7 @@ local function Render()
         if state.show_entities then
             DrawEntities(draw_list, center, pos.x, pos.y, pos.z, scale, heading, view_px, origin)
         end
+        DrawTrackingGuidance(draw_list, center, pos.x, pos.z, scale, heading, view_px, origin, circular)
         if state.show_player then
             DrawPlayerArrow(draw_list, center, heading)
         end
@@ -1090,8 +1247,16 @@ end
 -- Settings / persistence
 -- ---------------------------------------------------------------------------
 
+-- The group member markers ride the compass ring, so they go with it, or
+-- they would keep orbiting an empty spot on the screen.
 local function ToggleCompass()
-    if state.disable_compass then UI.DisableCompass() else UI.EnableCompass() end
+    if state.disable_compass then
+        UI.DisableCompass()
+        UI.DisableGroupCompassMarkers()
+    else
+        UI.EnableCompass()
+        UI.EnableGroupCompassMarkers()
+    end
 end
 
 local function TrackedEntitiesSettings()
@@ -1100,6 +1265,22 @@ local function TrackedEntitiesSettings()
     state.entity_tracking_enabled  = ImGui.Checkbox("Enable Entity Tracking", state.entity_tracking_enabled)
     state.ping_tracked_entities    = ImGui.Checkbox("Ping Tracked Entities", state.ping_tracked_entities)
     state.line_to_tracked_entities = ImGui.Checkbox("Line to Tracked Entities", state.line_to_tracked_entities)
+
+    -- The world map's pushed target lives outside the .entl list, shown here
+    -- so it is obvious the two maps are talking.
+    if state.db_track_active then
+        ImGui.Text("World Map Target: " .. (state.db_track_display or state.db_track_name or "?"))
+        ImGui.SameLine()
+        -- The world map owns the target, so this only raises a stop request
+        -- that it honors on its next frame.
+        if ImGui.Button("Stop Tracking##dbtrack") then
+            shared_globals.FF_Tracking_Stop = true
+        end
+    end
+    ImGui.Text("Guidance Line")
+    state.db_line_color = ImGui.ColorEdit4("Line Color", state.db_line_color, ImGuiColorEditFlags.NoInputs)
+    state.db_line_thickness = ImGui.SliderFloat("Line Thickness", state.db_line_thickness, 1.0, 6.0)
+    state.db_line_speed = ImGui.SliderFloat("Dash Speed", state.db_line_speed, 0, 120)
 
     ImGui.TextDisabled("Type a name and press Enter to track")
     local enter_returns_true_flag = (ImGuiInputTextFlags and ImGuiInputTextFlags.EnterReturnsTrue) or 0
@@ -1454,6 +1635,9 @@ local function Save()
         ping_tracked_entities = state.ping_tracked_entities,
         line_to_tracked_entities = state.line_to_tracked_entities,
         tracked_entities_file_name = state.tracked_entities_file_name,
+        db_line_color = state.db_line_color,
+        db_line_thickness = state.db_line_thickness,
+        db_line_speed = state.db_line_speed,
 
         disable_compass = state.disable_compass,
 
@@ -1495,6 +1679,7 @@ end
 
 local function Cleanup()
     UI.EnableCompass()
+    UI.EnableGroupCompassMarkers()
     if state.texture ~= nil then
         UiForge.ReleaseTexture(state.texture)
         state.texture = nil

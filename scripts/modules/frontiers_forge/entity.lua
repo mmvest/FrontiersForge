@@ -109,6 +109,30 @@ function Entity.GetDistanceTo(record, x, y, z)
     return math.sqrt(dx * dx + dy * dy + dz * dz)
 end
 
+--- Entity class byte. 0 and 1 are NPC kinds, 2 is a player character, and 3 is
+--- a player-side non-character (a pet). The game's own nameplate and target
+--- info code branches on exactly these values.
+--- @param record integer Entity record offset in EE memory.
+--- @return integer class_byte
+function Entity.GetClassByte(record)
+    return Util.ReadFromOffset(record + 0x256, "uint8_t")
+end
+
+--- Whether this entity is another player character rather than an NPC.
+--- @param record integer Entity record offset in EE memory.
+--- @return boolean is_player
+function Entity.IsPlayerCharacter(record)
+    return Entity.GetClassByte(record) == 2
+end
+
+--- Whether this entity is a world NPC, excluding player characters and their
+--- pets. Same test the game uses when picking nameplate styles.
+--- @param record integer Entity record offset in EE memory.
+--- @return boolean is_npc
+function Entity.IsNpc(record)
+    return Entity.GetClassByte(record) < 2
+end
+
 --- Id of the entity this entity is targeting.
 --- @param record integer Entity record offset in EE memory.
 --- @return integer target_id
@@ -140,6 +164,9 @@ function methods:GetPosition()      return Entity.GetPosition(self.record) end
 function methods:GetName()          return Entity.GetName(self.record) end
 function methods:GetLevel()         return Entity.GetLevel(self.record) end
 function methods:GetTargetId()      return Entity.GetTargetId(self.record) end
+function methods:GetClassByte()     return Entity.GetClassByte(self.record) end
+function methods:IsPlayerCharacter() return Entity.IsPlayerCharacter(self.record) end
+function methods:IsNpc()            return Entity.IsNpc(self.record) end
 function methods:GetDistanceTo(x, y, z) return Entity.GetDistanceTo(self.record, x, y, z) end
 function methods:GetDisposition()   return Entity.GetDisposition(self.record) end
 
@@ -157,6 +184,9 @@ local properties = {
     name             = Entity.GetName,
     level            = Entity.GetLevel,
     target_id        = Entity.GetTargetId,
+    class_byte       = Entity.GetClassByte,
+    is_player        = Entity.IsPlayerCharacter,
+    is_npc           = Entity.IsNpc,
     disposition      = Entity.GetDisposition,
     x                = function(record) return (Entity.GetPosition(record)) end,
     y                = function(record) local _, y = Entity.GetPosition(record) return y end,

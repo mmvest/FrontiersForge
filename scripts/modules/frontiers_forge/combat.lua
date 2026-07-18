@@ -8,9 +8,10 @@ local bit = require("bit")
 -- the dispatcher case and copy every event into a ring buffer Lua polls. The
 -- patch site is resolved from the VIWndGame overlay slide and verified against an
 -- exact instruction signature (with a scan fallback) before any write, and
--- uninstalling restores the original instruction then zeroes the cave. When the
--- Sandstorm patch already hooks the site, we chain onto the displaced
--- instruction inside its cave instead, so both game versions are supported.
+-- uninstalling restores the displaced instruction then zeroes the cave. When the
+-- Sandstorm patch already hooks the site, we take the site ourselves and jump
+-- into its cave from ours, so the raw packet fields are recorded before that
+-- patch can rewrite them and both game versions are supported.
 
 local Combat = {}
 
@@ -31,11 +32,16 @@ local SITE_SIGNATURE = {
 local ORIGINAL_OPCODE = SITE_SIGNATURE[1]
 
 -- The Sandstorm patch hooks this same dispatcher case, replacing the first two
--- signature words with a jal into its own cave plus a nop. Its cave re-executes
--- both displaced loads right before its jr ra, so when we find a foreign jal at
--- the site we follow it and patch the displaced lw a1 inside that cave instead.
--- A plain j is used there rather than jal so the cave's ra stays intact, and the
--- lw v0 that follows runs in our jump's delay slot.
+-- signature words with a jal into its own cave plus a nop. Its cave rewrites a
+-- pet event's attacker to the local player (that is how it shows pet damage
+-- numbers), so anything reading the event after it has run sees the pet's
+-- damage as the player's. To see the raw fields we take the site jal ourselves,
+-- record the event, then end our cave with a plain j into the foreign cave.
+-- Both jals set ra to site+8, and the j leaves ra alone, so the foreign cave's
+-- jr ra still returns to the dispatcher and its own logic runs unchanged.
+-- Earlier versions of this hook instead chained onto the displaced lw a1 at the
+-- end of the foreign cave, which is what read the rewritten fields; a leftover
+-- chain patch from one of those sessions is restored before installing.
 local FOREIGN_CAVE_SCAN_WORDS = 0x100
 
 -- Fallback signature-scan window
@@ -45,41 +51,81 @@ local SCAN_END   = 0x01800000
 -- 0x000F0000 sits in the EE kernel-reserved gap below the ELF load address, so
 -- EQOA never touches it. Verified all-zero before install to be safe.
 local CAVE_CODE_OFFSET = 0x000F0000
-local BUF_OFFSET       = 0x000F0080
+local BUF_OFFSET       = 0x000F00A0
 -- Buffer header: +0x0 total event counter (u32), +0x4 magic, +0x8/+0xC reserved because who knows what I'll need to add later.
--- Entries start at +0x10, stride 0x10:
+-- Entries start at +0x10, stride 0x20:
 --   +0x0 attacker_id (u32), +0x4 defender_id (u32),
---   +0x8 amount (int32, < 0 damage / > 0 heal), +0xC sequence number (u32)
+--   +0x8 amount (int32, < 0 damage / > 0 heal), +0xC sequence number (u32),
+--   +0x10 color (u32, the 0xDB trailer's tagged number color, 0 when absent),
+--   +0x14..+0x1C reserved
 local BUF_MAGIC   = 0x46464243 -- "CBFF" (combat buffer frontiersforge)
 local RING_SIZE   = 64         -- must be a power of two
 local RING_MASK   = RING_SIZE - 1
-local ENTRY_SIZE  = 0x10
+local ENTRY_SIZE  = 0x20
 local ENTRIES_OFFSET = BUF_OFFSET + 0x10
 local CAVE_REGION_END = ENTRIES_OFFSET + RING_SIZE * ENTRY_SIZE
+-- Where the previous buffer layout kept its magic, accepted as ours when
+-- cleaning up after a session that ran the old module.
+local OLD_BUF_MAGIC_OFFSET = 0x000F0084
 
--- Cave code. Clobbers t0-t5 and a1.
-local function BuildCaveCode()
+-- Cave code. Clobbers t0-t9 and a1 (all dead at the patch site, the foreign
+-- cave clobbers the same set). When chain_target is given the cave ends by
+-- jumping into the foreign cave instead of returning, so its logic still runs
+-- after the raw event is recorded.
+--
+-- Besides the three stack fields, the patched server appends an optional
+-- 3-byte trailer to 0xDB: an RGB number color, read little-endian and tagged
+-- with +0x1000000 (the same parse the Sandstorm cave does for its recoloring;
+-- pet swings arrive credited to the owner and colored red, 0x10000FF). The
+-- stream object sits on the dispatcher frame: buffer base at sp+0x4, read
+-- cursor at sp+0x10, end at sp+0xC. The cursor is already past the parsed
+-- fields at the patch site, so 3 or more remaining bytes means the trailer is
+-- present.
+local function BuildCaveCode(chain_target)
     local hi = bit.rshift(BUF_OFFSET, 16)
     local lo = bit.band(BUF_OFFSET, 0xFFFF)
-    return {
+    local code = {
         0x8FA508DC,                 -- lw    a1,0x8DC(sp)   displaced instruction (attacker)
         0x8FA908E0,                 -- lw    t1,0x8E0(sp)   amount (signed)
         0x8FAA08E4,                 -- lw    t2,0x8E4(sp)   defender
+        0x8FAE000C,                 -- lw    t6,0xC(sp)     stream end
+        0x8FAF0010,                 -- lw    t7,0x10(sp)    stream cursor
+        0x01CF7023,                 -- subu  t6,t6,t7       bytes left in the packet
+        0x29CE0003,                 -- slti  t6,t6,3
+        0x8FB80004,                 -- lw    t8,0x4(sp)     stream buffer base
+        0x030FC021,                 -- addu  t8,t8,t7
+        0x15C0000A,                 -- bnez  t6,+10         no trailer, keep the zero
+        0x0000C825,                 -- _or   t9,zero,zero   source id defaults to 0
+        0x93190000,                 -- lbu   t9,0x0(t8)     trailer byte 0
+        0x930C0001,                 -- lbu   t4,0x1(t8)     trailer byte 1
+        0x930D0002,                 -- lbu   t5,0x2(t8)     trailer byte 2
+        0x000C6200,                 -- sll   t4,t4,0x8
+        0x000D6C00,                 -- sll   t5,t5,0x10
+        0x032CC821,                 -- addu  t9,t9,t4
+        0x032DC821,                 -- addu  t9,t9,t5
+        0x3C0C0100,                 -- lui   t4,0x100
+        0x032CC821,                 -- addu  t9,t9,t4       tag as an entity id
         bit.bor(0x3C080000, hi),    -- lui   t0,hi(buffer)  build the address of the buffer
         bit.bor(0x35080000, lo),    -- ori   t0,t0,lo(buffer)
         0x8D0B0000,                 -- lw    t3,0x0(t0)     total event counter
         bit.bor(0x316C0000, RING_MASK), -- andi t4,t3,RING_MASK  get the slot we need to use via the total event counter, using the ring mask to make sure we stay within the ring buffer.
-        0x000C6900,                 -- sll   t5,t4,0x4      slot * ENTRY_SIZE (remember shifting left multiplies 2^n where n is the bits shifted left)
+        0x000C6940,                 -- sll   t5,t4,0x5      slot * ENTRY_SIZE
         0x01A86821,                 -- addu  t5,t5,t0       get the address of the entry we want to write in the ring buffer.
         0xADA50010,                 -- sw    a1,0x10(t5)    entry.attacker
         0xADAA0014,                 -- sw    t2,0x14(t5)    entry.defender
         0xADA90018,                 -- sw    t1,0x18(t5)    entry.amount
         0xADAB001C,                 -- sw    t3,0x1C(t5)    entry.seq
+        0xADB90020,                 -- sw    t9,0x20(t5)    entry.source
         0x256B0001,                 -- addiu t3,t3,0x1      add one to the total event counter
         0xAD0B0000,                 -- sw    t3,0x0(t0)     now update total event counter in the header
-        0x03E00008,                 -- jr    ra
-        0x00000000,                 -- _nop
     }
+    if chain_target ~= nil then
+        code[#code + 1] = bit.bor(0x08000000, bit.rshift(chain_target, 2)) -- j foreign cave
+    else
+        code[#code + 1] = 0x03E00008 -- jr ra
+    end
+    code[#code + 1] = 0x00000000 -- _nop
+    return code
 end
 
 local JAL_CAVE = bit.bor(0x0C000000, bit.rshift(CAVE_CODE_OFFSET, 2))
@@ -94,31 +140,40 @@ local function JalTarget(word)
     return bit.lshift(bit.band(word, 0x03FFFFFF), 2)
 end
 
--- Follows a foreign jal at the site into its cave and finds the displaced
--- lw a1 there (or our own j if a previous session already chained onto it).
--- Returns the offset to patch and whether it is already ours.
-local function ResolveChainSite(jal_word)
-    local target = JalTarget(jal_word)
-    if target <= 0 or target >= 0x02000000 - FOREIGN_CAVE_SCAN_WORDS * 4 then
-        return nil
-    end
+-- A leftover chain patch from an older version of this hook, which patched the
+-- displaced lw a1 at the end of the foreign cave with our j. Returns its
+-- address, or nil when the foreign cave is clean.
+local function FindLegacyChainPatch(target)
     for i = 0, FOREIGN_CAVE_SCAN_WORDS - 1 do
-        local word = Util.ReadFromOffset(target + i * 4, "uint32_t")
-        if Util.ReadFromOffset(target + (i + 1) * 4, "uint32_t") == SITE_SIGNATURE[2] then
-            if word == ORIGINAL_OPCODE then
-                return target + i * 4, false
-            end
-            if word == J_CAVE then
-                return target + i * 4, true
-            end
+        if Util.ReadFromOffset(target + i * 4, "uint32_t") == J_CAVE
+            and Util.ReadFromOffset(target + (i + 1) * 4, "uint32_t") == SITE_SIGNATURE[2] then
+            return target + i * 4
         end
     end
     return nil
 end
 
--- Classifies the four words at a candidate site. Returns the offset to patch,
--- the opcode to patch it with, and whether it is already patched, or nil when
--- the site does not look like the 0xDB dispatcher case at all.
+-- The foreign cave our installed cave chains into, recovered from the j at the
+-- cave's tail. Nil when the cave ends with a plain jr ra (no foreign hook).
+local function FindCaveChainTarget()
+    local words = (BUF_OFFSET - CAVE_CODE_OFFSET) / 4
+    for i = 0, words - 1 do
+        local word = Util.ReadFromOffset(CAVE_CODE_OFFSET + i * 4, "uint32_t")
+        if bit.band(word, 0xFC000000) == 0x08000000 then
+            return JalTarget(word)
+        end
+    end
+    return nil
+end
+
+-- Classifies the four words at a candidate site. Returns a table describing the
+-- install, or nil when the site does not look like the 0xDB dispatcher case:
+--   site    the dispatcher word to patch with our jal
+--   restore what the site word goes back to on uninstall (the original load,
+--           or the foreign hook's jal when one owns the site)
+--   chain   foreign cave to jump into from our cave's tail, or nil
+--   already true when the site already holds our jal
+--   legacy  address of an old-style chain patch to clean up first, or nil
 local function ClassifySite(site)
     local w1 = Util.ReadFromOffset(site, "uint32_t")
     local w3 = Util.ReadFromOffset(site + 8, "uint32_t")
@@ -128,19 +183,30 @@ local function ClassifySite(site)
     end
 
     if w1 == JAL_CAVE then
-        return site, JAL_CAVE, true
-    end
-    local w2 = Util.ReadFromOffset(site + 4, "uint32_t")
-    if w1 == ORIGINAL_OPCODE and w2 == SITE_SIGNATURE[2] then
-        return site, JAL_CAVE, false
+        -- Already ours. What the site must go back to lives in our cave's
+        -- tail: a j there means a foreign hook owned the site before us.
+        local chain = FindCaveChainTarget()
+        local restore = ORIGINAL_OPCODE
+        if chain ~= nil then
+            restore = bit.bor(0x0C000000, bit.rshift(chain, 2))
+        end
+        return { site = site, restore = restore, chain = chain, already = true }
     end
 
-    -- A foreign hook (the Sandstorm patch) owns the site, so chain onto the
-    -- displaced instruction inside its cave.
+    local w2 = Util.ReadFromOffset(site + 4, "uint32_t")
+    if w1 == ORIGINAL_OPCODE and w2 == SITE_SIGNATURE[2] then
+        return { site = site, restore = ORIGINAL_OPCODE, already = false }
+    end
+
+    -- A foreign hook (the Sandstorm patch) owns the site. Take the site and
+    -- chain into its cave, cleaning up any patch an older session left inside.
     if IsJal(w1) and w2 == 0 then
-        local chain, already = ResolveChainSite(w1)
-        if chain ~= nil then
-            return chain, J_CAVE, already
+        local target = JalTarget(w1)
+        if target > 0 and target < 0x02000000 - FOREIGN_CAVE_SCAN_WORDS * 4 then
+            return {
+                site = site, restore = w1, chain = target, already = false,
+                legacy = FindLegacyChainPatch(target),
+            }
         end
     end
     return nil
@@ -152,50 +218,49 @@ local function ScanForSite()
     local s3, s4 = SITE_SIGNATURE[3], SITE_SIGNATURE[4]
     for i = 0, words - 4 do
         if mem[i + 2] == s3 and mem[i + 3] == s4 then
-            local site, opcode, already = ClassifySite(SCAN_START + i * 4)
-            if site ~= nil then
-                return site, opcode, already
+            local info = ClassifySite(SCAN_START + i * 4)
+            if info ~= nil then
+                return info
             end
         end
     end
     return nil
 end
 
--- Returns the offset to patch (the dispatcher site itself, or the displaced
--- instruction inside a foreign hook's cave), the opcode to write there, and
--- whether it already holds our patch, or nil plus a reason.
+-- Resolves the dispatcher site and how to install there (see ClassifySite),
+-- or nil plus a reason.
 local function ResolvePatchSite()
     local draw_ptr_offset = Util.GetOffsetFromPointerChain(WND_GAME_STATIC_PTR, WND_GAME_DRAW_STEPS)
     if draw_ptr_offset == nil then
-        return nil, nil, nil, "game UI not loaded (are you in game?)"
+        return nil, "game UI not loaded (are you in game?)"
     end
     local draw_runtime = Util.ReadFromOffset(draw_ptr_offset, "uint32_t")
     if draw_runtime == 0 or draw_runtime >= 0x02000000 then
-        return nil, nil, nil, "bad draw-function pointer"
+        return nil, "bad draw-function pointer"
     end
 
     local slide = draw_runtime - WND_GAME_DRAW_STATIC
     local site = PATCH_SITE_STATIC + slide
 
     if site > 0 and site < 0x02000000 - 0x10 then
-        local resolved, opcode, already = ClassifySite(site)
-        if resolved ~= nil then
-            return resolved, opcode, already, nil
+        local info = ClassifySite(site)
+        if info ~= nil then
+            return info
         end
     end
 
     -- Slide assumption failed so scan for the signature instead.
-    local resolved, opcode, already = ScanForSite()
-    if resolved ~= nil then
-        return resolved, opcode, already, nil
+    local info = ScanForSite()
+    if info ~= nil then
+        return info
     end
-    return nil, nil, nil, "0xDB dispatcher signature not found"
+    return nil, "0xDB dispatcher signature not found"
 end
 
 local hook_state = {
     installed = false,
     patch_site = nil,
-    patch_opcode = nil, -- jal at the dispatcher site, or j inside a foreign cave
+    restore_word = nil, -- what the site goes back to on uninstall
     last_seq = 0,       -- next sequence number we have not yet returned
     dropped = 0,        -- events lost to ring overruns across all polls
 }
@@ -214,16 +279,17 @@ function Combat.InstallHook()
         return true
     end
 
-    local site, opcode, already_patched, err = ResolvePatchSite()
-    if site == nil then
+    local info, err = ResolvePatchSite()
+    if info == nil then
         return false, "combat hook: " .. err
     end
 
     -- The cave region must contain all zeros or our own magic (leftover from a previous session,
-    -- e.g. script reloaded without uninstalling). Anything else means the region is in use and we
-    -- probably shouldn't touch it.
+    -- e.g. script reloaded without uninstalling), at either the current or the old buffer layout's
+    -- location. Anything else means the region is in use and we probably shouldn't touch it.
     local magic = Util.ReadFromOffset(BUF_OFFSET + 4, "uint32_t")
-    if magic ~= BUF_MAGIC then
+    local old_magic = Util.ReadFromOffset(OLD_BUF_MAGIC_OFFSET, "uint32_t")
+    if magic ~= BUF_MAGIC and old_magic ~= BUF_MAGIC then
         for offset = CAVE_CODE_OFFSET, CAVE_REGION_END - 4, 4 do
             if Util.ReadFromOffset(offset, "uint32_t") ~= 0 then
                 return false, "combat hook: cave region at 0xF0000 is not free"
@@ -231,10 +297,17 @@ function Combat.InstallHook()
         end
     end
 
+    -- An old-style chain patch inside the foreign cave has to go back to the
+    -- displaced load before the site is taken, since together they would form
+    -- a loop between the two caves.
+    if info.legacy ~= nil then
+        Util.WriteToOffset(info.legacy, "uint32_t", ORIGINAL_OPCODE)
+    end
+
     -- Write the cave and buffer header first, then patch the dispatcher, so
     -- the branch target is always valid code by the time anything can jump
     -- to it.
-    local code = BuildCaveCode()
+    local code = BuildCaveCode(info.chain)
     for i, word in ipairs(code) do
         Util.WriteToOffset(CAVE_CODE_OFFSET + (i - 1) * 4, "uint32_t", word)
     end
@@ -243,38 +316,49 @@ function Combat.InstallHook()
     Util.WriteToOffset(BUF_OFFSET + 8, "uint32_t", RING_SIZE)
     Util.WriteToOffset(BUF_OFFSET + 12, "uint32_t", 0)
 
-    if not already_patched then
-        Util.WriteToOffset(site, "uint32_t", opcode)
+    if not info.already then
+        Util.WriteToOffset(info.site, "uint32_t", JAL_CAVE)
     end
 
     hook_state.installed = true
-    hook_state.patch_site = site
-    hook_state.patch_opcode = opcode
+    hook_state.patch_site = info.site
+    hook_state.restore_word = info.restore
     hook_state.last_seq = 0
     hook_state.dropped = 0
     return true
 end
 
---- Restores the original dispatcher instruction and zeroes the cave region.
---- Safe to call even if the hook is not installed.
+--- Puts the dispatcher site back (to the original load, or to the foreign
+--- hook's jal when one owned it) and zeroes the cave region. Safe to call even
+--- if the hook is not installed.
 --- @return boolean success True on success (including when there is nothing to clean up).
 function Combat.UninstallHook()
     local site = hook_state.patch_site
-    local opcode = hook_state.patch_opcode
+    local restore = hook_state.restore_word
     if site == nil then
         -- Maybe a previous session left the hook in place, so find it just in case.
-        local resolved, found_opcode, already_patched = ResolvePatchSite()
-        if resolved == nil or not already_patched then
+        local info = ResolvePatchSite()
+        if info == nil then
             return true -- nothing to clean up
         end
-        site = resolved
-        opcode = found_opcode
+        if not info.already then
+            -- The site is not ours, but an old session may still have left its
+            -- chain patch inside the foreign cave.
+            if info.legacy ~= nil then
+                Util.WriteToOffset(info.legacy, "uint32_t", ORIGINAL_OPCODE)
+                for offset = CAVE_CODE_OFFSET, CAVE_REGION_END - 4, 4 do
+                    Util.WriteToOffset(offset, "uint32_t", 0)
+                end
+            end
+            return true
+        end
+        site = info.site
+        restore = info.restore
     end
 
-    -- Only restore if the site actually holds our patch. Both the dispatcher
-    -- site and the foreign cave's displaced slot originally hold the same word.
-    if Util.ReadFromOffset(site, "uint32_t") == opcode then
-        Util.WriteToOffset(site, "uint32_t", ORIGINAL_OPCODE)
+    -- Only restore if the site actually holds our patch.
+    if Util.ReadFromOffset(site, "uint32_t") == JAL_CAVE then
+        Util.WriteToOffset(site, "uint32_t", restore or ORIGINAL_OPCODE)
     end
 
     -- With the patch gone nothing can reach the cave, so now we can overwrite it with zeros.
@@ -284,7 +368,7 @@ function Combat.UninstallHook()
 
     hook_state.installed = false
     hook_state.patch_site = nil
-    hook_state.patch_opcode = nil
+    hook_state.restore_word = nil
     hook_state.last_seq = 0
     return true
 end
@@ -296,6 +380,73 @@ local function GetLocalPlayerId()
         return nil
     end
     return Util.ReadFromOffset(offset, "uint32_t")
+end
+
+local function GetPetId()
+    -- Pet entity id at singleton+0x2BE50, -1 when no pet is up.
+    local offset = Util.GetOffsetFromPointerChain(0x4E37F0, { 0x2BE4C })
+    if offset == nil then
+        return nil
+    end
+    local id = Util.ReadFromOffset(offset, "uint32_t")
+    if id == 0xFFFFFFFF or id == 0 then
+        return nil
+    end
+    return id
+end
+
+--- @return integer|nil pet_id Entity id of the local player's pet, or nil when no pet is up.
+function Combat.GetPetEntityId()
+    return GetPetId()
+end
+
+--- A snapshot of everything the hook resolved, for diagnosing capture problems
+--- in game. Fields: installed, patch_site, site_word (what the site holds right
+--- now), restore_word, chain_target (foreign cave we jump into, nil when the
+--- site was vanilla), player_id, pet_id, event_count, dropped.
+--- @return table info
+function Combat.GetHookInfo()
+    local info = {
+        installed = hook_state.installed,
+        patch_site = hook_state.patch_site,
+        restore_word = hook_state.restore_word,
+        player_id = GetLocalPlayerId(),
+        pet_id = GetPetId(),
+        event_count = Combat.GetEventCount(),
+        dropped = hook_state.dropped,
+    }
+    if hook_state.patch_site ~= nil then
+        info.site_word = Util.ReadFromOffset(hook_state.patch_site, "uint32_t")
+    end
+    if hook_state.installed then
+        info.chain_target = FindCaveChainTarget()
+    end
+    return info
+end
+
+--- The foreign (Sandstorm) cave's code, when one owns the 0xDB site. Words are
+--- read from the chain target up to its jr ra, so the patch's actual logic can
+--- be copied out of a live game for offline disassembly.
+--- @param max_words integer|nil Cap on words returned, default 64.
+--- @return table[]|nil rows Array of { addr = ea, word = u32 }, nil when not chained.
+function Combat.ReadForeignCave(max_words)
+    local target = hook_state.installed and FindCaveChainTarget() or nil
+    if target == nil then
+        return nil
+    end
+    max_words = max_words or 64
+    local rows = {}
+    for i = 0, max_words - 1 do
+        local addr = target + i * 4
+        local word = Util.ReadFromOffset(addr, "uint32_t")
+        rows[#rows + 1] = { addr = addr, word = word }
+        if word == 0x03E00008 then -- jr ra, plus its delay slot
+            local slot = target + (i + 1) * 4
+            rows[#rows + 1] = { addr = slot, word = Util.ReadFromOffset(slot, "uint32_t") }
+            break
+        end
+    end
+    return rows
 end
 
 --- @return integer count Total number of combat events captured since the hook was installed.
@@ -316,8 +467,16 @@ end
 ---   defender_id  entity id of whoever received it
 ---   amount       signed: negative = damage, positive = healing
 ---   seq          monotonically increasing event number
----   outgoing     true if attacker is the local player
+---   color        the patched 0xDB trailer, a per-hit number color as
+---                0x1000000 | B<<16 | G<<8 | R (pet swings observed as
+---                0x10000FF, pure red), nil when the packet had none
+---   outgoing     true if the local player dealt it themselves (pet excluded)
 ---   incoming     true if defender is the local player
+---   from_pet     true if the local player's pet dealt it: the pet's own id as
+---                attacker, or a color-tagged event attributed to the player
+---                (the server credits pet swings to the owner and marks them
+---                only by the color)
+---   to_pet       true if defender is the local player's pet
 ---   is_heal      true if amount > 0
 --- @return table[] events Array of event tables, oldest first. Empty if none or hook not installed.
 function Combat.PollEvents()
@@ -340,6 +499,7 @@ function Combat.PollEvents()
     end
 
     local player_id = GetLocalPlayerId()
+    local pet_id = GetPetId()
     for seq = first, count - 1 do
         local entry = ENTRIES_OFFSET + bit.band(seq, RING_MASK) * ENTRY_SIZE
         -- The seq stamp detects an entry overwritten between our count read
@@ -348,13 +508,25 @@ function Combat.PollEvents()
             local amount = Util.ReadFromOffset(entry + 0x8, "int32_t")
             local attacker = Util.ReadFromOffset(entry, "uint32_t")
             local defender = Util.ReadFromOffset(entry + 0x4, "uint32_t")
+            local color = Util.ReadFromOffset(entry + 0x10, "uint32_t")
+            if color == 0 then
+                color = nil
+            end
+            -- A pet's own id shows up as the attacker on its heals, but its
+            -- swings are credited to the owner with only the color trailer to
+            -- tell them apart from the player's.
+            local from_pet = pet_id ~= nil
+                and (attacker == pet_id or (attacker == player_id and color ~= nil))
             events[#events + 1] = {
                 attacker_id = attacker,
                 defender_id = defender,
+                color = color,
                 amount = amount,
                 seq = seq,
-                outgoing = (attacker == player_id),
+                outgoing = (attacker == player_id) and not from_pet,
                 incoming = (defender == player_id),
+                from_pet = from_pet,
+                to_pet = (pet_id ~= nil and defender == pet_id),
                 is_heal = amount > 0,
             }
         else

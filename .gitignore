@@ -29,3 +29,6 @@ scripts/profiles/
 # the party and such. It is pretty cool but seemed like no one would really use it (let alone 60 people).
 # If anyone is interested in this, message me or make a request on github.
 scripts/eqoa_tools/
+
+# Ignore my "journals" for the world map
+*journal.json

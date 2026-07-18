@@ -167,6 +167,12 @@ function Player.GetCoordinates()
     return { x = x, y = y, z = z }
 end
 
+--- The local player's own entity id.
+--- @return integer entity_id
+function Player.GetEntityId()
+    return Util.ReadFromOffset(0x1FB6928, "uint32_t")
+end
+
 function Player.GetTargetEntityId()
     local current_target_offset = 0x1FBB870
     return Util.ReadFromOffset(current_target_offset, "uint32_t")

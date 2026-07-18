@@ -273,6 +273,16 @@ function Util.IsInGame()
     return Util.ReadFromOffset(is_in_game_offset, "uint8_t")
 end
 
+--- The index of the world the player is currently in.
+--- 0 tunaria, 1 rathe, 2 odus, 3 lavastm, 4 planesky, 5 secrets, and on
+--- patched clients 6 underfoot, 7 secrets2. Set when the client loads a
+--- world's .esf, so it is only meaningful while in game.
+--- @return integer world_id Index into the game's world table.
+function Util.GetWorldId()
+    local world_index_offset = 0x1FB5D60
+    return Util.ReadFromOffset(world_index_offset, "uint32_t")
+end
+
 --- Whether the start menu is currently open.
 --- @return integer is_open Nonzero when the start menu is open, 0 otherwise or when not in game.
 function Util.IsStartMenuOpen()

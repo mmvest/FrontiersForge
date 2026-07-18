@@ -102,6 +102,11 @@ combat_totals = combat_totals or {
     damage_done = 0, damage_taken = 0, healing_done = 0, healing_taken = 0,
 }
 
+-- The last raw combat events, for the debug panel in the settings. Diagnosing
+-- attribution needs the ids exactly as the hook recorded them.
+combat_event_log = combat_event_log or {}
+local EVENT_LOG_SIZE = 16
+
 -- Cooldown countdowns per ability id. The game stores a whole lockout and never
 -- counts it down, so the countdown runs off the rising edge here.
 cooldown_running = cooldown_running or {}
@@ -163,11 +168,16 @@ local function UpdateCombatTotals()
         return
     end
     for _, event in ipairs(Combat.PollEvents()) do
-        if event.outgoing or event.incoming then
+        combat_event_log[#combat_event_log + 1] = event
+        while #combat_event_log > EVENT_LOG_SIZE do
+            table.remove(combat_event_log, 1)
+        end
+        if event.outgoing or event.incoming or event.from_pet then
             local amount = math.abs(event.amount)
             local done = event.is_heal and "healing_done" or "damage_done"
             local taken = event.is_heal and "healing_taken" or "damage_taken"
-            if event.outgoing then
+            -- The pet's damage counts as the player's, by choice.
+            if event.outgoing or event.from_pet then
                 combat_totals[done] = combat_totals[done] + amount
                 -- Damage landing on the current target feeds its health estimate.
                 if not event.is_heal and target_estimate ~= nil
@@ -536,14 +546,17 @@ local function DrawTargetFrame(now_ms)
 end
 
 -- One row per active member of the in game group. Health is the game's coarse
--- percent, so the cells draw in the percent only style.
+-- percent, so the cells draw in the percent only style. The game's member
+-- array includes the local player, who already has a dedicated frame, so that
+-- entry is filtered out by entity id.
 local function BuildGroupRoster()
     if not Group.IsInGroup() then
         return {}
     end
+    local player_id = Player.GetEntityId()
     local roster = {}
     for _, member in Group.Members() do
-        if member:IsActive() then
+        if member:IsActive() and member:GetEntityId() ~= player_id then
             local coords = member:GetCoordinates()
             roster[#roster + 1] = {
                 name = member:GetName(),
@@ -608,14 +621,16 @@ local function DrawMeter(now_ms)
     local encounter = solo_meter:GetEncounter()
     local totals = solo_meter:GetTotals()
     local overall = solo_meter:GetOverall()
-    local row = {
-        client_id = 1,
-        name = Player.GetName() or "You",
-        class_id = Player.GetClassId(),
-        damage_done = totals.damage_done, damage_taken = totals.damage_taken,
-        healing_done = totals.healing_done, healing_taken = totals.healing_taken,
-        all_damage_done = overall.damage_done, all_damage_taken = overall.damage_taken,
-        all_healing_done = overall.healing_done, all_healing_taken = overall.healing_taken,
+    local roster = {
+        {
+            client_id = 1,
+            name = Player.GetName() or "You",
+            class_id = Player.GetClassId(),
+            damage_done = totals.damage_done, damage_taken = totals.damage_taken,
+            healing_done = totals.healing_done, healing_taken = totals.healing_taken,
+            all_damage_done = overall.damage_done, all_damage_taken = overall.damage_taken,
+            all_healing_done = overall.healing_done, all_healing_taken = overall.healing_taken,
+        },
     }
 
     ImGui.SetNextWindowSize(320, 160, ImGuiCond.FirstUseEver)
@@ -623,10 +638,10 @@ local function DrawMeter(now_ms)
     if ImGui.Begin("wereoxxs damage meter", true, METER_FLAGS) then
         GridEdit(now_ms)
         ApplyWindowFont("meter")
-        meter_data.roster = { row }
+        meter_data.roster = roster
         meter_data.duration_ms = encounter.duration_ms
         meter_data.history = solo_meter:GetHistory()
-        meter_data.session_roster = DamageMeter.OverallRoster({ row })
+        meter_data.session_roster = DamageMeter.OverallRoster(roster)
         meter_data.fighting_ms = DamageMeter.FightingMs(meter_data.history, encounter)
 
         draw_opts.now_ms = now_ms
@@ -895,6 +910,54 @@ local function Settings()
 
     if ImGui.TreeNode("Damage meter") then
         DamageMeter.DrawSettings(meter_config)
+        ImGui.TreePop()
+    end
+
+    -- Everything needed to diagnose event attribution: what the hook resolved,
+    -- which ids the game reports for the player and the pet, and the raw events
+    -- exactly as they came off the wire.
+    if ImGui.TreeNode("Combat debug") then
+        local info = Combat.GetHookInfo()
+        ImGui.Text(string.format("hook installed: %s", tostring(info.installed)))
+        ImGui.Text(string.format("patch site: %s  holds: %s",
+            info.patch_site and string.format("0x%08X", info.patch_site) or "-",
+            info.site_word and string.format("0x%08X", info.site_word) or "-"))
+        ImGui.Text(string.format("restore word: %s  chain target: %s",
+            info.restore_word and string.format("0x%08X", info.restore_word) or "-",
+            info.chain_target and string.format("0x%08X", info.chain_target) or "none"))
+        ImGui.Text(string.format("player id: %s  pet id (+0x2BE50): %s",
+            info.player_id and string.format("0x%X", info.player_id) or "-",
+            info.pet_id and string.format("0x%X", info.pet_id) or "none"))
+        local pet = info.pet_id and EntityList.GetEntityById(info.pet_id) or nil
+        ImGui.Text(string.format("pet entity: %s",
+            pet and (pet:GetName() or "?") or "not in entity list"))
+        ImGui.Text(string.format("events: %d  dropped: %d", info.event_count, info.dropped))
+
+        ImGui.Separator()
+        ImGui.Text("Raw events, newest last")
+        for _, event in ipairs(combat_event_log) do
+            ImGui.Text(string.format("#%d atk 0x%X def 0x%X clr %s amt %d%s%s%s%s",
+                event.seq, event.attacker_id, event.defender_id,
+                event.color and string.format("0x%X", event.color) or "-",
+                event.amount,
+                event.outgoing and " OUT" or "", event.incoming and " IN" or "",
+                event.from_pet and " PET" or "", event.to_pet and " TOPET" or ""))
+        end
+
+        ImGui.Separator()
+        -- The foreign patch's cave, printed so it can be copied out of a
+        -- screenshot and disassembled offline.
+        if ImGui.TreeNode("Foreign cave code") then
+            local rows = Combat.ReadForeignCave()
+            if rows == nil then
+                ImGui.Text("not chained onto a foreign hook")
+            else
+                for _, row in ipairs(rows) do
+                    ImGui.Text(string.format("0x%08X: 0x%08X", row.addr, row.word))
+                end
+            end
+            ImGui.TreePop()
+        end
         ImGui.TreePop()
     end
 
